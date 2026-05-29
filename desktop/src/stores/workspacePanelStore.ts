@@ -431,6 +431,10 @@ export const useWorkspacePanelStore = create<WorkspacePanelStore>((set, get) => 
   },
 
   openPreview: async (sessionId, path, kind) => {
+    // Ensure the workspace panel is visible — openPreview is now triggered from places
+    // where the panel may be closed (e.g. the chat "打开方式" menu / turn-changes card),
+    // not only from inside the already-open file tree.
+    get().openPanel(sessionId)
     const tabId = getWorkspacePreviewTabId(path, kind)
     const requestKey = makePreviewKey(sessionId, tabId)
     const existing = get().previewTabsBySession[sessionId]?.find((tab) => tab.id === tabId)

@@ -305,6 +305,15 @@ describe('workspacePanelStore', () => {
     ])
   })
 
+  it('openPreview opens the workspace panel when it was closed', async () => {
+    mocks.getWorkspaceFileMock.mockResolvedValue({
+      state: 'ok', path: 'src/a.ts', content: 'export const a = 1', language: 'typescript', size: 18,
+    })
+    expect(useWorkspacePanelStore.getState().isPanelOpen('session-closed-preview')).toBe(false)
+    await useWorkspacePanelStore.getState().openPreview('session-closed-preview', 'src/a.ts', 'file')
+    expect(useWorkspacePanelStore.getState().isPanelOpen('session-closed-preview')).toBe(true)
+  })
+
   it('opens preview tabs, supports multiple kinds, and reuses duplicates without persistence', async () => {
     const storage = typeof globalThis.localStorage === 'undefined' ? null : globalThis.localStorage
     const setItemSpy = storage ? vi.spyOn(storage, 'setItem') : null

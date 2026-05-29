@@ -68,4 +68,18 @@ describe('OpenWithMenu', () => {
     fireEvent.mouseDown(document.body)
     expect(onClose).toHaveBeenCalledTimes(1)
   })
+
+  it('flips above the anchor when it would overflow the viewport bottom', () => {
+    // The trigger often sits right above the composer; the menu must not render off-screen below it.
+    Object.defineProperty(window, 'innerHeight', { value: 300, configurable: true })
+    Object.defineProperty(window, 'innerWidth', { value: 1000, configurable: true })
+    const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+      height: 200, width: 220, top: 0, left: 0, right: 0, bottom: 0, x: 0, y: 0, toJSON: () => ({}),
+    } as DOMRect)
+    // anchor near the bottom: top:260/bottom:270. Down would be 276, 276+200=476 > 300-8 ⇒ flip up.
+    render(<OpenWithMenu items={makeItems()} anchor={{ top: 260, bottom: 270, left: 20, right: 120 }} onClose={vi.fn()} />)
+    // flipped top = anchor.top - height - 6 = 260 - 200 - 6 = 54
+    expect(screen.getByRole('menu').style.top).toBe('54px')
+    rectSpy.mockRestore()
+  })
 })

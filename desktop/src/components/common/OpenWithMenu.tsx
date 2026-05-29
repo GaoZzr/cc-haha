@@ -1,5 +1,5 @@
 import { createPortal } from 'react-dom'
-import { useEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Globe, ExternalLink, FileText } from 'lucide-react'
 import { TargetIcon } from './TargetIcon'
 import type { OpenWithItem } from '../../lib/openWithItems'
@@ -17,8 +17,35 @@ function ItemIcon({ item }: { item: OpenWithItem }) {
   return <ExternalLink size={18} strokeWidth={1.9} />
 }
 
+const MARGIN = 8
+
 export function OpenWithMenu({ items, anchor, onClose }: Props) {
   const ref = useRef<HTMLDivElement>(null)
+  // Initial guess; corrected (before paint) by the layout effect once we can measure the menu.
+  const [pos, setPos] = useState<{ top: number; left: number }>(() => ({
+    top: anchor.bottom + 6,
+    left: Math.max(MARGIN, Math.min(anchor.left, window.innerWidth - 240 - MARGIN)),
+  }))
+
+  // Position viewport-aware: flip above the anchor if it would overflow the bottom
+  // (the trigger often sits right above the composer), and clamp into the viewport.
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const { height, width } = el.getBoundingClientRect()
+    const vh = window.innerHeight
+    const vw = window.innerWidth
+
+    let top = anchor.bottom + 6
+    if (height > 0 && top + height > vh - MARGIN) {
+      const flipped = anchor.top - height - 6
+      top = flipped >= MARGIN ? flipped : Math.max(MARGIN, vh - height - MARGIN)
+    }
+    let left = anchor.left
+    if (width > 0) left = Math.max(MARGIN, Math.min(left, vw - width - MARGIN))
+    setPos({ top, left })
+  }, [anchor])
+
   useEffect(() => {
     const onDown = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) onClose() }
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -31,8 +58,8 @@ export function OpenWithMenu({ items, anchor, onClose }: Props) {
     <div
       ref={ref}
       role="menu"
-      className="fixed z-50 min-w-[220px] overflow-hidden rounded-[12px] border border-[var(--color-border)] bg-[var(--color-surface)] py-1 shadow-[var(--shadow-dropdown)]"
-      style={{ top: anchor.bottom + 6, left: Math.min(anchor.left, window.innerWidth - 240) }}
+      className="fixed min-w-[220px] overflow-hidden rounded-[12px] border border-[var(--color-border)] bg-[var(--color-surface)] py-1 shadow-[var(--shadow-dropdown)]"
+      style={{ top: pos.top, left: pos.left, zIndex: 1000 }}
     >
       {items.map((item) => (
         <button
