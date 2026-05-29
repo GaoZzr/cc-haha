@@ -32,7 +32,7 @@ describe('subscribePreviewEvents', () => {
     const payload = { pageUrl: 'http://x/', element: { selector: '#t', tag: 'h1', classes: [] }, change: { description: '改一下' }, screenshot: { dataUrl: 'data:image/png;base64,AAAA', kind: 'element' } }
     listeners['preview://event']!({ payload: JSON.stringify({ v: 1, type: 'selection', payload }) })
     expect(prefill).toHaveBeenCalledWith('s1', expect.objectContaining({
-      text: expect.stringContaining('#t'),
+      text: expect.stringContaining('改一下'),
       attachments: [expect.objectContaining({ type: 'image', data: 'data:image/png;base64,AAAA' })],
     }))
   })
