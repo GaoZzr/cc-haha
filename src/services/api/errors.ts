@@ -430,6 +430,9 @@ export function extractUnknownErrorFormat(value: unknown): string | undefined {
 export function isUnsupportedImageInputErrorMessage(message: string): boolean {
   const raw = message.toLowerCase()
   if (!raw.includes('image')) return false
+  if (raw.includes('image_url') && raw.includes('expected') && raw.includes('text')) {
+    return true
+  }
   return (
     raw.includes('not support') ||
     raw.includes('not supported') ||

@@ -17,6 +17,11 @@ describe('image unsupported API errors', () => {
         'unsupported modality: image input is not available',
       ),
     ).toBe(true)
+    expect(
+      isUnsupportedImageInputErrorMessage(
+        'Failed to deserialize the JSON body into the target type: messages[1]: unknown variant `image_url`, expected `text` at line 1 column 394097',
+      ),
+    ).toBe(true)
     expect(isUnsupportedImageInputErrorMessage('image exceeds maximum')).toBe(false)
   })
 
