@@ -1,6 +1,6 @@
-import { listen } from '@tauri-apps/api/event'
 import { useBrowserPanelStore } from '../stores/browserPanelStore'
 import { useChatStore } from '../stores/chatStore'
+import { getDesktopHost } from './desktopHost'
 import { buildSelectionDirectMessage, type SelectionPayload } from './selectionComposer'
 
 function kindLabel(kind?: string): string {
@@ -10,15 +10,23 @@ function kindLabel(kind?: string): string {
 }
 
 export async function subscribePreviewEvents(sessionId: string): Promise<() => void> {
-  return listen<string>('preview://event', (e) => {
+  const host = getDesktopHost()
+  if (!host.capabilities.previewWebview) return () => {}
+
+  return host.preview.onEvent((payload) => {
     let msg: { type?: string; url?: string; title?: string; dataUrl?: string; kind?: string; payload?: unknown }
-    try { msg = JSON.parse(e.payload) } catch { return }
+    try {
+      msg = typeof payload === 'string'
+        ? JSON.parse(payload)
+        : payload as typeof msg
+    } catch { return }
     const store = useBrowserPanelStore.getState()
     if (msg.type === 'navigated' && msg.url) store.setNavigated(sessionId, msg.url, msg.title ?? '')
     else if (msg.type === 'ready') store.setReady(sessionId)
     else if (msg.type === 'screenshot' && msg.dataUrl) {
       useChatStore.getState().queueComposerPrefill(sessionId, {
         text: '',
+        mode: 'append',
         attachments: [{ type: 'image', name: `screenshot-${kindLabel(msg.kind)}.png`, mimeType: 'image/png', data: msg.dataUrl }],
       })
     }

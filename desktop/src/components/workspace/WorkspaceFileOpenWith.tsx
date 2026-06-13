@@ -3,17 +3,26 @@ import { ExternalLink } from 'lucide-react'
 import { useTranslation, type TranslationKey } from '../../i18n'
 import { useOpenTargetStore } from '../../stores/openTargetStore'
 import { buildOpenWithItems, type OpenWithItem, type OpenWithDeps } from '../../lib/openWithItems'
+import { getDesktopHost } from '../../lib/desktopHost'
+import { getServerBaseUrl } from '../../lib/desktopRuntime'
+import { openWithContextForWorkspaceFile } from '../../lib/openWithContextForHref'
+import { useBrowserPanelStore } from '../../stores/browserPanelStore'
+import { useWorkspacePanelStore } from '../../stores/workspacePanelStore'
 import { TargetIcon } from '../common/TargetIcon'
 
 function openExternal(path: string) {
-  void import('@tauri-apps/plugin-shell').then((m) => m.open(path)).catch(() => {})
+  void getDesktopHost().shell.openPath(path).catch(() => {})
 }
 
 export function WorkspaceFileOpenWith({
   absolutePath,
+  sessionId,
+  workspacePath,
   onAfterSelect,
 }: {
   absolutePath: string
+  sessionId?: string
+  workspacePath?: string
   onAfterSelect?: () => void
 }) {
   const t = useTranslation()
@@ -29,8 +38,14 @@ export function WorkspaceFileOpenWith({
   // but OpenWithDeps.t expects (key: string, vars?: Record<string, string>) => string.
   // All keys buildOpenWithItems calls are valid TranslationKeys, so the cast is safe.
   const deps: OpenWithDeps = {
-    openInAppBrowser: () => {},
-    openWorkspacePreview: () => {},
+    openInAppBrowser: (url) => {
+      if (!sessionId) return
+      useBrowserPanelStore.getState().open(sessionId, url)
+    },
+    openWorkspacePreview: (relPath) => {
+      if (!sessionId) return
+      void useWorkspacePanelStore.getState().openPreview(sessionId, relPath, 'file')
+    },
     openSystem: (p) => openExternal(p),
     openTarget: (id, p) => {
       void openTarget(id, p)
@@ -38,7 +53,12 @@ export function WorkspaceFileOpenWith({
     t: (key, vars) => t(key as TranslationKey, vars),
   }
   const items: OpenWithItem[] = buildOpenWithItems(
-    { kind: 'file', absolutePath, previewable: false },
+    sessionId && workspacePath
+      ? openWithContextForWorkspaceFile(workspacePath, absolutePath, {
+        sessionId,
+        serverBaseUrl: getServerBaseUrl(),
+      })
+      : { kind: 'file', absolutePath, previewable: false },
     targets,
     deps,
   )

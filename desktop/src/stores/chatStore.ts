@@ -26,10 +26,12 @@ import type {
   ComputerUsePermissionResponse,
   GoalEventAction,
   MemoryEventFile,
+  StreamingFallbackState,
   UIAttachment,
   UIMessage,
   ServerMessage,
   TokenUsage,
+  PermissionUpdate,
 } from '../types/chat'
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
@@ -39,6 +41,15 @@ type CompactSummaryMessage = Extract<UIMessage, { type: 'compact_summary' }>
 export type ComposerDraftState = {
   input: string
   attachments: ComposerAttachment[]
+}
+
+export type QueuedUserMessage = {
+  id: string
+  content: string
+  attachments?: AttachmentRef[]
+  displayContent: string
+  displayAttachments?: AttachmentRef[]
+  createdAt: number
 }
 
 export type ComposerReferenceInsertion = {
@@ -52,6 +63,8 @@ export type ComposerReferenceInsertion = {
   }
   nonce: number
 }
+
+export type ComposerPrefillMode = 'replace' | 'append'
 
 export type PerSessionState = {
   messages: UIMessage[]
@@ -76,9 +89,24 @@ export type PerSessionState = {
     request: ComputerUsePermissionRequest
   } | null
   tokenUsage: TokenUsage
+  /**
+   * Bumped each time a compact boundary arrives. The context usage indicator
+   * watches this to force an immediate re-read of the (now much smaller)
+   * context instead of waiting for the next API response (#743).
+   * Optional: legacy persisted sessions predate the field.
+   */
+  compactCount?: number
+  /**
+   * Characters streamed by the assistant during the current turn (text,
+   * thinking, tool input). ÷4 approximates output tokens for the streaming
+   * indicator — same estimation the CLI spinner uses. Reset on each send.
+   */
+  streamingResponseChars: number
   elapsedSeconds: number
   statusVerb: string
   apiRetry?: ApiRetryState | null
+  // 流式→非流式降级提示（活动回合状态，与 apiRetry 同清除时机）。
+  streamingFallback?: StreamingFallbackState | null
   slashCommands: Array<{ name: string; description: string; argumentHint?: string }>
   agentTaskNotifications: Record<string, AgentTaskNotification>
   backgroundAgentTasks?: Record<string, BackgroundAgentTask>
@@ -87,10 +115,12 @@ export type PerSessionState = {
   composerPrefill?: {
     text: string
     attachments?: UIAttachment[]
+    mode?: ComposerPrefillMode
     nonce: number
   } | null
   composerInsertion?: ComposerReferenceInsertion | null
   composerDraft?: ComposerDraftState | null
+  queuedUserMessages?: QueuedUserMessage[]
 }
 
 const DEFAULT_SESSION_STATE: PerSessionState = {
@@ -107,9 +137,12 @@ const DEFAULT_SESSION_STATE: PerSessionState = {
   pendingPermission: null,
   pendingComputerUsePermission: null,
   tokenUsage: { input_tokens: 0, output_tokens: 0 },
+  compactCount: 0,
+  streamingResponseChars: 0,
   elapsedSeconds: 0,
   statusVerb: '',
   apiRetry: null,
+  streamingFallback: null,
   slashCommands: [],
   agentTaskNotifications: {},
   backgroundAgentTasks: {},
@@ -118,10 +151,16 @@ const DEFAULT_SESSION_STATE: PerSessionState = {
   composerPrefill: null,
   composerInsertion: null,
   composerDraft: null,
+  queuedUserMessages: [],
 }
 
 function createDefaultSessionState(): PerSessionState {
-  return { ...DEFAULT_SESSION_STATE, messages: [], tokenUsage: { input_tokens: 0, output_tokens: 0 } }
+  return {
+    ...DEFAULT_SESSION_STATE,
+    messages: [],
+    tokenUsage: { input_tokens: 0, output_tokens: 0 },
+    queuedUserMessages: [],
+  }
 }
 
 type ChatStore = {
@@ -143,6 +182,8 @@ type ChatStore = {
     options?: {
       rule?: string
       updatedInput?: Record<string, unknown>
+      denyMessage?: string
+      permissionUpdates?: PermissionUpdate[]
     },
   ) => void
   respondToComputerUsePermission: (
@@ -157,8 +198,9 @@ type ChatStore = {
   reloadHistory: (sessionId: string) => Promise<void>
   queueComposerPrefill: (
     sessionId: string,
-    prefill: { text: string; attachments?: UIAttachment[] },
+    prefill: { text: string; attachments?: UIAttachment[]; mode?: ComposerPrefillMode },
   ) => void
+  clearComposerPrefill: (sessionId: string, nonce?: number) => void
   queueComposerInsertion: (
     sessionId: string,
     insertion: Omit<ComposerReferenceInsertion, 'nonce'>,
@@ -166,6 +208,13 @@ type ChatStore = {
   clearComposerInsertion: (sessionId: string, nonce?: number) => void
   setComposerDraft: (sessionId: string, draft: ComposerDraftState) => void
   clearComposerDraft: (sessionId: string) => void
+  queueUserMessage: (
+    sessionId: string,
+    message: Omit<QueuedUserMessage, 'id' | 'createdAt'>,
+  ) => string
+  updateQueuedUserMessage: (sessionId: string, messageId: string, content: string) => void
+  removeQueuedUserMessage: (sessionId: string, messageId: string) => void
+  sendQueuedUserMessage: (sessionId: string, messageId: string) => void
   clearMessages: (sessionId: string) => void
   handleServerMessage: (sessionId: string, msg: ServerMessage) => void
 }
@@ -825,6 +874,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           messages: existing?.messages ?? [],
           activeGoal: existing?.activeGoal ?? null,
           composerDraft: existing?.composerDraft ?? null,
+          queuedUserMessages: existing?.queuedUserMessages ?? [],
         },
       },
     }))
@@ -959,8 +1009,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             chatState: 'thinking',
             elapsedSeconds: 0,
             streamingText: '',
+            streamingResponseChars: 0,
             statusVerb: isMemberSession ? '' : randomSpinnerVerb(),
             apiRetry: null,
+            streamingFallback: null,
             elapsedTimer: timer,
             connectionState: isMemberSession ? 'connected' : session.connectionState,
           },
@@ -1000,6 +1052,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       allowed,
       ...(options?.rule ? { rule: options.rule } : {}),
       ...(options?.updatedInput ? { updatedInput: options.updatedInput } : {}),
+      ...(options?.denyMessage ? { denyMessage: options.denyMessage } : {}),
+      ...(options?.permissionUpdates?.length ? { permissionUpdates: options.permissionUpdates } : {}),
     })
     set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, () => ({ pendingPermission: null, chatState: allowed ? 'tool_executing' : 'idle' })) }))
   },
@@ -1051,6 +1105,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             pendingPermission: null,
             pendingComputerUsePermission: null,
             apiRetry: null,
+            streamingFallback: null,
             elapsedTimer: null,
           },
         },
@@ -1180,6 +1235,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             elapsedTimer: null,
             statusVerb: '',
             apiRetry: null,
+            streamingFallback: null,
           })),
         }
       })
@@ -1203,9 +1259,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         composerPrefill: {
           text: prefill.text,
           attachments: prefill.attachments,
+          mode: prefill.mode,
           nonce: Date.now(),
         },
       })),
+    }))
+  },
+
+  clearComposerPrefill: (sessionId, nonce) => {
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, (session) => {
+        if (nonce !== undefined && session.composerPrefill?.nonce !== nonce) return {}
+        return { composerPrefill: null }
+      }),
     }))
   },
 
@@ -1252,6 +1318,97 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }))
   },
 
+  queueUserMessage: (sessionId, message) => {
+    const id = `queued-user-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    set((state) => {
+      const session = state.sessions[sessionId] ?? createDefaultSessionState()
+      return {
+        sessions: {
+          ...state.sessions,
+          [sessionId]: {
+            ...session,
+            queuedUserMessages: [
+              ...(session.queuedUserMessages ?? []),
+              {
+                ...message,
+                id,
+                createdAt: Date.now(),
+              },
+            ],
+          },
+        },
+      }
+    })
+    return id
+  },
+
+  updateQueuedUserMessage: (sessionId, messageId, content) => {
+    const nextContent = content.trim()
+    if (!nextContent) return
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, (session) => ({
+        queuedUserMessages: (session.queuedUserMessages ?? []).map((message) =>
+          message.id === messageId
+            ? {
+                ...message,
+                content: replaceQueuedMessageDisplayContent(message, nextContent),
+                displayContent: nextContent,
+              }
+            : message),
+      })),
+    }))
+  },
+
+  removeQueuedUserMessage: (sessionId, messageId) => {
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, (session) => ({
+        queuedUserMessages: (session.queuedUserMessages ?? []).filter((message) => message.id !== messageId),
+      })),
+    }))
+  },
+
+  sendQueuedUserMessage: (sessionId, messageId) => {
+    const session = get().sessions[sessionId]
+    const queuedMessage = (session?.queuedUserMessages ?? []).find((message) => message.id === messageId)
+    if (!session || !queuedMessage) return
+
+    if (session.chatState === 'idle') {
+      get().removeQueuedUserMessage(sessionId, messageId)
+      get().sendMessage(
+        sessionId,
+        queuedMessage.content,
+        queuedMessage.attachments,
+        {
+          displayContent: queuedMessage.displayContent,
+          displayAttachments: queuedMessage.displayAttachments,
+        },
+      )
+      return
+    }
+
+    const now = Date.now()
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, (currentSession) => {
+        const pendingText = `${currentSession.streamingText}${consumePendingDelta(sessionId)}`
+        const baseMessages = pendingText.trim()
+          ? appendAssistantTextMessage(currentSession.messages, pendingText, now)
+          : currentSession.messages
+        return {
+          messages: appendOptimisticQueuedUserMessage(baseMessages, queuedMessage, now),
+          queuedUserMessages: (currentSession.queuedUserMessages ?? [])
+            .filter((message) => message.id !== messageId),
+          ...(pendingText.trim() ? { streamingText: '' } : {}),
+        }
+      }),
+    }))
+
+    wsManager.send(sessionId, {
+      type: 'user_message',
+      content: queuedMessage.content,
+      attachments: queuedMessage.attachments,
+    })
+  },
+
   clearMessages: (sessionId) => {
     clearPendingTaskToolUseIds(sessionId)
     clearPendingToolParentUseIds(sessionId)
@@ -1262,6 +1419,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       streamingText: '',
       chatState: 'idle',
       apiRetry: null,
+      streamingFallback: null,
+      queuedUserMessages: [],
     })) }))
   },
 
@@ -1308,9 +1467,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
               : msg.verb && msg.verb !== 'Thinking'
                 ? msg.verb
                 : '',
-            ...(msg.tokens ? { tokenUsage: { ...session.tokenUsage, output_tokens: msg.tokens } } : {}),
             ...(msg.state === 'idle' ? { activeThinkingId: null } : {}),
-            ...(msg.state === 'idle' ? { apiRetry: null } : {}),
+            ...(msg.state === 'idle' ? { apiRetry: null, streamingFallback: null } : {}),
             ...(nextMessages !== session.messages ? { messages: nextMessages } : {}),
             ...(shouldFlush ? {
               streamingText: '',
@@ -1328,6 +1486,18 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         useTabStore.getState().updateTabStatus(sessionId, msg.state === 'idle' ? 'idle' : 'running')
         break
 
+      case 'permission_mode_changed': {
+        // CLI 是权限模式的真相来源。这里把它恢复/切换后的权威值校正到本地镜像。
+        // 注意：只更新本地状态，**不要**走 setSessionPermissionMode —— 那会把
+        // set_permission_mode 再回发给 CLI 形成回环。未知模式（如未启用对应特性
+        // 的 'auto'）直接忽略，避免选择器拿到无法渲染的值。
+        const KNOWN_MODES: PermissionMode[] = ['default', 'acceptEdits', 'plan', 'bypassPermissions', 'dontAsk']
+        if (KNOWN_MODES.includes(msg.mode)) {
+          useSessionStore.getState().updateSessionPermissionMode(sessionId, msg.mode)
+        }
+        break
+      }
+
       case 'content_start': {
         const session = get().sessions[sessionId]
         if (!session) break
@@ -1344,6 +1514,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             chatState: 'streaming',
             activeThinkingId: null,
             apiRetry: null,
+            streamingFallback: null,
           }))
         } else if (msg.blockType === 'tool_use') {
           clearPendingToolInputDelta(sessionId)
@@ -1372,6 +1543,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             chatState: 'tool_executing',
             activeThinkingId: null,
             apiRetry: null,
+            streamingFallback: null,
           }))
         }
         break
@@ -1399,6 +1571,23 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         break
       }
 
+      case 'streaming_fallback': {
+        // 进入非流式降级阶段：旧的重试横幅（针对失败的流式请求）已过时，
+        // 清掉换成降级提示；后续非流式重试到来的 api_retry 会重新接管显示。
+        update((session) => ({
+          streamingFallback: {
+            cause: msg.cause,
+            receivedAt: Date.now(),
+          },
+          apiRetry: null,
+          chatState: session.chatState === 'idle' ? 'thinking' : session.chatState,
+          activeThinkingId: null,
+          statusVerb: '',
+        }))
+        useTabStore.getState().updateTabStatus(sessionId, 'running')
+        break
+      }
+
       case 'content_delta':
         if (msg.text !== undefined) {
           if (!get().sessions[sessionId]) break
@@ -1408,7 +1597,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
               const text = pendingDeltaBySession.get(sessionId) ?? ''
               pendingDeltaBySession.delete(sessionId)
               flushTimerBySession.delete(sessionId)
-              update((s) => ({ streamingText: s.streamingText + text }))
+              update((s) => ({
+                streamingText: s.streamingText + text,
+                streamingResponseChars: s.streamingResponseChars + text.length,
+              }))
             }, 50)
             flushTimerBySession.set(sessionId, timer)
           }
@@ -1424,6 +1616,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                 const activeToolUseId = s.activeToolUseId
                 return {
                   streamingToolInput: partialInput,
+                  streamingResponseChars: s.streamingResponseChars + text.length,
                   ...(activeToolUseId
                     ? {
                         messages: upsertToolUseMessage(s.messages, activeToolUseId, (existing) => {
@@ -1460,7 +1653,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           if (last && last.type === 'thinking') {
             const updated = [...base]
             updated[updated.length - 1] = { ...last, content: last.content + msg.text }
-            return { messages: updated, chatState: 'thinking', activeThinkingId: last.id, streamingText: '' }
+            return {
+              messages: updated,
+              chatState: 'thinking',
+              activeThinkingId: last.id,
+              streamingText: '',
+              streamingResponseChars: s.streamingResponseChars + msg.text.length,
+            }
           }
           const id = nextId()
           return {
@@ -1468,6 +1667,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             chatState: 'thinking',
             activeThinkingId: id,
             streamingText: '',
+            streamingResponseChars: s.streamingResponseChars + msg.text.length,
           }
         })
         break
@@ -1564,6 +1764,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           chatState: 'permission_pending',
           activeThinkingId: null,
           apiRetry: null,
+          streamingFallback: null,
           messages:
             msg.toolName === 'AskUserQuestion'
               ? s.messages
@@ -1598,6 +1799,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           chatState: 'permission_pending',
           activeThinkingId: null,
           apiRetry: null,
+          streamingFallback: null,
         }))
         break
 
@@ -1625,6 +1827,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           pendingComputerUsePermission: null,
           elapsedTimer: null,
           apiRetry: null,
+          streamingFallback: null,
         }))
         useTabStore.getState().updateTabStatus(sessionId, 'idle')
         const appendedCompletionMessage = completionMessages !== session.messages
@@ -1641,6 +1844,24 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           })
         }
         refreshCompletedTranscriptHistory(get, sessionId)
+        for (const queuedMessage of get().sessions[sessionId]?.queuedUserMessages ?? []) {
+          get().sendQueuedUserMessage(sessionId, queuedMessage.id)
+        }
+        break
+      }
+
+      case 'user_message_replay': {
+        update((session) => {
+          const pendingText = `${session.streamingText}${consumePendingDelta(sessionId)}`
+          const baseMessages = pendingText.trim()
+            ? appendAssistantTextMessage(session.messages, pendingText, Date.now())
+            : session.messages
+          return {
+            messages: appendReplayedUserMessage(baseMessages, msg.content, Date.now()),
+            ...(pendingText.trim() ? { streamingText: '' } : {}),
+            activeThinkingId: null,
+          }
+        })
         break
       }
 
@@ -1672,6 +1893,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             pendingPermission: null,
             pendingComputerUsePermission: null,
             apiRetry: null,
+            streamingFallback: null,
           }
         })
         useTabStore.getState().updateTabStatus(sessionId, 'error')
@@ -1735,7 +1957,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             elapsedSeconds: 0,
             statusVerb: '',
             apiRetry: null,
+            streamingFallback: null,
             tokenUsage: { input_tokens: 0, output_tokens: 0 },
+            streamingResponseChars: 0,
             slashCommands: [],
             activeGoal: null,
             backgroundAgentTasks: {},
@@ -1754,6 +1978,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           update((session) => ({
             chatState: session.chatState === 'compacting' ? 'thinking' : session.chatState,
             statusVerb: session.chatState === 'compacting' ? '' : session.statusVerb,
+            compactCount: (session.compactCount ?? 0) + 1,
             messages: appendOrUpdateTailCompactSummary(
               session.messages,
               {
@@ -1900,10 +2125,10 @@ function updateOptimisticSessionTitle(sessionId: string, content: string): void 
   useTabStore.getState().updateTabTitle(sessionId, title)
 }
 
-// ─── History mapping helpers (unchanged from original) ─────────
+// ─── History mapping helpers ─────────
 
 type AssistantHistoryBlock = { type: string; text?: string; thinking?: string; name?: string; id?: string; input?: unknown }
-type UserHistoryBlock = { type: string; text?: string; tool_use_id?: string; content?: unknown; is_error?: boolean; source?: { data?: string }; mimeType?: string; media_type?: string; name?: string }
+type UserHistoryBlock = { type: string; text?: string; tool_use_id?: string; content?: unknown; is_error?: boolean; source?: { data?: string; media_type?: string }; mimeType?: string; media_type?: string; name?: string }
 
 const TASK_NOTIFICATION_RE = /^<task-notification>\s*[\s\S]*<\/task-notification>$/i
 const GOAL_EVENT_ACTIONS = new Set<GoalEventAction>([
@@ -1924,6 +2149,130 @@ const GOAL_EVENT_ACTIONS = new Set<GoalEventAction>([
  */
 function isTeammateMessage(text: string): boolean {
   return text.includes('<teammate-message') && text.includes('</teammate-message>')
+}
+
+const SIMPLE_IMAGE_SOURCE_RE = /^\[Image source: (.+)\]$/
+const DETAILED_IMAGE_SOURCE_RE = /^\[Image: source: (.+?)(?:, original \d+x\d+, displayed at \d+x\d+\. Multiply coordinates by \d+(?:\.\d+)? to map to original image\.)?\]$/
+const IMAGE_RESIZE_METADATA_RE = /^\[Image: original \d+x\d+, displayed at \d+x\d+\. Multiply coordinates by \d+(?:\.\d+)? to map to original image\.\]$/
+const VISUAL_SELECTION_PROMPT_HEADER = '请根据截图中编号 1 的蓝色标注修改本地前端。'
+const VISUAL_SELECTION_PROMPT_FOOTER = '请优先依据截图里的编号标注定位元素，selector 只作为辅助线索。'
+
+type VisualSelectionHistoryDisplay = {
+  displayName: string
+  selector?: string
+  note?: string
+}
+
+function getHistoryImageMediaType(block: UserHistoryBlock): string {
+  const mediaType = block.source?.media_type ?? block.mimeType ?? block.media_type
+  return mediaType?.startsWith('image/') ? mediaType : 'image/png'
+}
+
+function normalizeHistoryImageData(data: string | undefined, mediaType: string): string | undefined {
+  const trimmed = data?.trim()
+  if (!trimmed) return undefined
+  if (/^data:image\//i.test(trimmed)) return trimmed
+  return `data:${mediaType};base64,${trimmed}`
+}
+
+function extractImageMetadataSourcePath(text: string): string | undefined {
+  const trimmed = text.trim()
+  const simpleMatch = trimmed.match(SIMPLE_IMAGE_SOURCE_RE)
+  if (simpleMatch?.[1]) return simpleMatch[1]
+  const detailedMatch = trimmed.match(DETAILED_IMAGE_SOURCE_RE)
+  if (detailedMatch?.[1]) return detailedMatch[1]
+  return undefined
+}
+
+function isGeneratedImageMetadataText(text: string): boolean {
+  return Boolean(extractImageMetadataSourcePath(text)) || IMAGE_RESIZE_METADATA_RE.test(text.trim())
+}
+
+/**
+ * Strip the generated image-metadata lines (`[Image source: …]`, resize notes)
+ * that the server appends to a user turn's text. The optimistic message never
+ * carried them, so live-replay dedupe must normalize them away first — otherwise
+ * `findCurrentTurnUserMessageIndex` never matches and the raw prompt leaks in as
+ * a duplicate bubble. This was most visible on Windows, where the appended
+ * absolute upload path (`[Image source: C:\Users\…\uploads\…png]`) made the
+ * mismatch obvious, but it affects any message that carries an image.
+ */
+export function stripGeneratedImageMetadataLines(text: string): string {
+  return text
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .filter((line) => !isGeneratedImageMetadataText(line))
+    .join('\n')
+    .trim()
+}
+
+function parseVisualSelectionHistoryPrompt(text: string): VisualSelectionHistoryDisplay | null {
+  const lines = text.replace(/\r\n?/g, '\n').split('\n')
+  if (lines[0]?.trim() !== VISUAL_SELECTION_PROMPT_HEADER) return null
+
+  let displayName: string | undefined
+  let selector: string | undefined
+  let note: string | undefined
+
+  for (let index = 1; index < lines.length; index += 1) {
+    const line = lines[index]?.trim() ?? ''
+    if (line.startsWith('目标元素：')) {
+      displayName = line.slice('目标元素：'.length).trim()
+    } else if (line.startsWith('Selector：')) {
+      selector = line.slice('Selector：'.length).trim()
+    } else if (line === '用户注释：') {
+      const noteLines: string[] = []
+      for (let noteIndex = index + 1; noteIndex < lines.length; noteIndex += 1) {
+        const noteLine = lines[noteIndex] ?? ''
+        if (noteLine.trim() === VISUAL_SELECTION_PROMPT_FOOTER) break
+        noteLines.push(noteLine)
+      }
+      const trimmedNote = noteLines.join('\n').trim()
+      note = trimmedNote || undefined
+      break
+    }
+  }
+
+  return displayName
+    ? {
+        displayName,
+        ...(selector ? { selector } : {}),
+        ...(note ? { note } : {}),
+      }
+    : null
+}
+
+function applyVisualSelectionHistoryDisplay(attachments: UIAttachment[], display: VisualSelectionHistoryDisplay): void {
+  const imageAttachment = attachments.find((attachment) => attachment.type === 'image')
+  if (!imageAttachment) return
+  imageAttachment.name = display.displayName
+  if (display.selector) imageAttachment.quote = display.selector
+  if (display.note) imageAttachment.note = display.note
+}
+
+function normalizeHistoryImageAttachment(block: UserHistoryBlock): UIAttachment {
+  const mediaType = getHistoryImageMediaType(block)
+  return {
+    type: 'image',
+    name: block.name || 'image',
+    data: normalizeHistoryImageData(block.source?.data, mediaType),
+    mimeType: mediaType,
+  }
+}
+
+function applyImageMetadataSourcePaths(attachments: UIAttachment[], sourcePaths: string[]): void {
+  let imageIndex = 0
+  for (const sourcePath of sourcePaths) {
+    const attachment = attachments
+      .slice(imageIndex)
+      .find((candidate) => candidate.type === 'image')
+    if (!attachment) return
+    imageIndex = attachments.indexOf(attachment) + 1
+    attachment.path = sourcePath
+    if (!attachment.name || attachment.name === 'image') {
+      attachment.name = getReferenceName(sourcePath)
+    }
+  }
 }
 
 function extractHistoryTextBlocks(content: unknown): string[] {
@@ -2414,6 +2763,122 @@ function extractLeadingFileReferences(text: string): {
   }
 }
 
+export function appendReplayedUserMessage(
+  messages: UIMessage[],
+  content: string,
+  timestamp: number,
+): UIMessage[] {
+  // The replayed text carries server-appended image-metadata lines that the
+  // optimistic message never had. Normalize them away (same as the history
+  // mapping) so the dedupe below can match the already-rendered message instead
+  // of appending the raw prompt — paths and all — as a duplicate bubble.
+  const sanitized = stripGeneratedImageMetadataLines(content) || content.trim()
+  const parsed = extractLeadingFileReferences(sanitized)
+  const displayContent = parsed.content.trim() || sanitized
+  if (!displayContent) return messages
+
+  const modelContent = parsed.modelContent ?? sanitized
+  const currentTurnUserIndex = findCurrentTurnUserMessageIndex(messages, modelContent)
+  if (currentTurnUserIndex >= 0) {
+    const optimisticMessage = messages[currentTurnUserIndex]
+    if (optimisticMessage?.type === 'user_text' && optimisticMessage.optimisticQueued) {
+      const { optimisticQueued: _optimisticQueued, ...confirmedMessage } = optimisticMessage
+      return [
+        ...messages.slice(0, currentTurnUserIndex),
+        confirmedMessage,
+        ...messages.slice(currentTurnUserIndex + 1),
+      ]
+    }
+    return messages
+  }
+
+  return [
+    ...messages,
+    {
+      id: nextId(),
+      type: 'user_text',
+      content: displayContent,
+      ...(parsed.modelContent ? { modelContent: parsed.modelContent } : {}),
+      ...(parsed.attachments ? { attachments: parsed.attachments } : {}),
+      timestamp,
+    },
+  ]
+}
+
+function appendOptimisticQueuedUserMessage(
+  messages: UIMessage[],
+  message: QueuedUserMessage,
+  timestamp: number,
+): UIMessage[] {
+  const displayContent = message.displayContent.trim()
+  const modelContent = message.content.trim()
+  const attachments = mapQueuedDisplayAttachments(message.displayAttachments)
+  if (!displayContent && !attachments) return messages
+
+  return [
+    ...messages,
+    {
+      id: nextId(),
+      type: 'user_text',
+      content: displayContent,
+      ...(modelContent && modelContent !== displayContent ? { modelContent } : {}),
+      ...(attachments ? { attachments } : {}),
+      timestamp,
+      optimisticQueued: true,
+    },
+  ]
+}
+
+function mapQueuedDisplayAttachments(attachments?: AttachmentRef[]): UIAttachment[] | undefined {
+  if (!attachments?.length) return undefined
+  return attachments.map((attachment) => ({
+    type: attachment.type,
+    name: attachment.name || attachment.path || attachment.mimeType || attachment.type,
+    path: attachment.path,
+    data: attachment.data,
+    mimeType: attachment.mimeType,
+    isDirectory: attachment.isDirectory,
+    lineStart: attachment.lineStart,
+    lineEnd: attachment.lineEnd,
+    note: attachment.note,
+    quote: attachment.quote,
+  }))
+}
+
+function findCurrentTurnUserMessageIndex(
+  messages: UIMessage[],
+  modelContent: string,
+): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message?.type !== 'user_text') {
+      continue
+    }
+    return (message.modelContent ?? message.content).trim() === modelContent ? index : -1
+  }
+  return -1
+}
+
+function replaceQueuedMessageDisplayContent(
+  message: QueuedUserMessage,
+  nextDisplayContent: string,
+): string {
+  const currentModelContent = message.content.trim()
+  const currentDisplayContent = message.displayContent.trim()
+  if (!currentModelContent) return nextDisplayContent
+  if (!currentDisplayContent) return `${currentModelContent}\n\n${nextDisplayContent}`
+  if (currentModelContent === currentDisplayContent) return nextDisplayContent
+
+  const displaySuffix = `\n\n${currentDisplayContent}`
+  if (currentModelContent.endsWith(displaySuffix)) {
+    return `${currentModelContent.slice(0, -currentDisplayContent.length)}${nextDisplayContent}`
+  }
+  if (currentModelContent.endsWith(currentDisplayContent)) {
+    return `${currentModelContent.slice(0, -currentDisplayContent.length)}${nextDisplayContent}`
+  }
+  return `${currentModelContent}\n\n${nextDisplayContent}`
+}
+
 /**
  * Reconstruct agentTaskNotifications from history.
  *
@@ -2629,16 +3094,27 @@ export function mapHistoryMessagesToUiMessages(
       continue
     }
     if ((msg.type === 'user' || msg.type === 'tool_result') && Array.isArray(msg.content)) {
-      const textParts: string[] = []
+      const visibleTextParts: string[] = []
+      const modelTextParts: string[] = []
       const attachments: UIAttachment[] = []
+      const imageSourcePaths: string[] = []
+      const hasImageBlock = (msg.content as UserHistoryBlock[]).some((block) => block.type === 'image')
       for (const block of msg.content as UserHistoryBlock[]) {
         if (block.type === 'text' && block.text && isTeammateMessage(block.text)) {
+          modelTextParts.push(block.text)
           if (!includeTeammateMessages) continue
-          textParts.push(...extractVisibleTeammateMessageContents(block.text))
+          visibleTextParts.push(...extractVisibleTeammateMessageContents(block.text))
         } else if (block.type === 'text' && block.text) {
-          textParts.push(block.text)
+          modelTextParts.push(block.text)
+          const imageSourcePath = hasImageBlock ? extractImageMetadataSourcePath(block.text) : undefined
+          if (imageSourcePath) {
+            imageSourcePaths.push(imageSourcePath)
+          }
+          if (!hasImageBlock || !isGeneratedImageMetadataText(block.text)) {
+            visibleTextParts.push(block.text)
+          }
         }
-        else if (block.type === 'image') attachments.push({ type: 'image', name: block.name || 'image', data: block.source?.data, mimeType: block.mimeType || block.media_type })
+        else if (block.type === 'image') attachments.push(normalizeHistoryImageAttachment(block))
         else if (block.type === 'file') attachments.push({ type: 'file', name: block.name || 'file' })
         else if (block.type === 'tool_result') uiMessages.push({
           id: nextId(),
@@ -2650,15 +3126,27 @@ export function mapHistoryMessagesToUiMessages(
           parentToolUseId: msg.parentToolUseId,
         })
       }
-      if (textParts.length > 0 || attachments.length > 0) {
-        const parsed = extractLeadingFileReferences(textParts.join('\n'))
+      applyImageMetadataSourcePaths(attachments, imageSourcePaths)
+      if (visibleTextParts.length > 0 || attachments.length > 0) {
+        const visibleText = visibleTextParts.join('\n')
+        const modelText = modelTextParts.join('\n')
+        const visualSelectionDisplay =
+          msg.type === 'user' && hasImageBlock
+            ? parseVisualSelectionHistoryPrompt(modelText)
+            : null
+        if (visualSelectionDisplay) {
+          applyVisualSelectionHistoryDisplay(attachments, visualSelectionDisplay)
+        }
+        const parsed = extractLeadingFileReferences(visibleText)
+        const userContent = visualSelectionDisplay ? '' : parsed.content
+        const modelContent = visualSelectionDisplay || modelText !== visibleText ? modelText : parsed.modelContent
         const allAttachments = [...(parsed.attachments ?? []), ...attachments]
         uiMessages.push({
           id: msg.id || nextId(),
           type: 'user_text',
-          content: parsed.content,
+          content: userContent,
           ...(msg.id ? { transcriptMessageId: msg.id } : {}),
-          ...(parsed.modelContent ? { modelContent: parsed.modelContent } : {}),
+          ...(modelContent ? { modelContent } : {}),
           attachments: allAttachments.length > 0 ? allAttachments : undefined,
           timestamp,
         })

@@ -18,14 +18,44 @@ describe('chat blocks', () => {
     const { container } = render(<ThinkingBlock content="this is a long internal reasoning trace" isActive />)
 
     expect(screen.getByText(/Thinking/)).toBeTruthy()
-    expect(container.textContent).toContain('this is a long internal reasoning trace')
+    expect(container.textContent).not.toContain('this is a long internal reasoning trace')
     expect(container.querySelector('.thinking-cursor')).toBeNull()
   })
 
   it('does not animate inactive historical thinking blocks', () => {
     const { container } = render(<ThinkingBlock content="old reasoning" isActive={false} />)
 
-    expect(container.querySelector('.thinking-inline-cursor')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /Thought/ }))
+
+    expect(container.textContent).toContain('old reasoning')
+    expect(container.querySelector('.thinking-cursor')).toBeNull()
+  })
+
+  it('renders thinking content as markdown only after expanding', () => {
+    const { container } = render(<ThinkingBlock content={'**important**\n\n- item one'} />)
+
+    expect(container.textContent).not.toContain('important')
+    expect(container.querySelector('strong')).toBeNull()
+    expect(container.querySelector('li')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /Thought/ }))
+
+    expect(container.querySelector('strong')?.textContent).toBe('important')
+    expect(container.querySelector('li')?.textContent).toBe('item one')
+  })
+
+  it('hides full thinking content until expanded', () => {
+    const content = Array.from({ length: 12 }, (_, index) => `line-${index + 1}`).join('\n')
+    const { container } = render(<ThinkingBlock content={content} />)
+
+    expect(container.textContent).not.toContain('line-1')
+    expect(container.textContent).not.toContain('line-11')
+
+    fireEvent.click(screen.getByRole('button', { name: /Thought/ }))
+
+    expect(container.textContent).toContain('line-1')
+    expect(container.textContent).toContain('line-11')
+    expect(container.textContent).toContain('line-12')
   })
 
   it('shows tool previews only after expanding the tool block', () => {
@@ -129,6 +159,84 @@ describe('chat blocks', () => {
     expect(container.textContent).toContain('fatal: unrecognized argument: --no-stat')
   })
 
+  it('shows full bash error output when the tool block is expanded', () => {
+    const lines = Array.from({ length: 8 }, (_, index) => `detail line ${index + 1}`)
+    const fullError = [
+      '<tool_use_error>InputValidationError: Bash failed due to the following issues: The required parameter `description` is missing.',
+      ...lines,
+      'final remediation hint: provide a concise command description.',
+    ].join('\n')
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'bun run check:server' }}
+        result={{ content: fullError, isError: true }}
+      />,
+    )
+
+    expect(container.textContent).toContain('InputValidationError')
+    expect(container.textContent).not.toContain('final remediation hint')
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('Error Output')
+    expect(container.textContent).toContain('detail line 8')
+    expect(container.textContent).toContain('final remediation hint')
+  })
+
+  it('shows read tool validation errors when the tool block is expanded', () => {
+    const fullError = [
+      '<tool_use_error>InputValidationError: Read failed due to the following issues:',
+      'The required parameter `file_path` is missing.',
+      'The provided limit must be greater than 0.',
+    ].join('\n')
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Read"
+        input={{}}
+        result={{ content: fullError, isError: true }}
+      />,
+    )
+
+    expect(container.textContent).toContain('Read')
+    expect(container.textContent).not.toContain('file_path')
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('Error Output')
+    expect(container.textContent).toContain('file_path')
+    expect(container.textContent).toContain('limit must be greater than 0')
+  })
+
+  it('keeps edit previews while showing edit tool error output when expanded', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Edit"
+        input={{
+          file_path: '/tmp/example.ts',
+          old_string: 'const enabled = false',
+          new_string: 'const enabled = true',
+        }}
+        result={{
+          content: [
+            'InputValidationError: Edit failed due to the following issues:',
+            'The provided old_string was not found in the file.',
+          ].join('\n'),
+          isError: true,
+        }}
+      />,
+    )
+
+    expect(container.textContent).toContain('Edit')
+    expect(container.textContent).not.toContain('old_string was not found')
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('example.ts')
+    expect(container.textContent).toContain('Error Output')
+    expect(container.textContent).toContain('old_string was not found')
+  })
+
   it('expands tool errors so full Computer Use gate messages are readable', () => {
     const { container } = render(
       <ToolCallBlock
@@ -173,6 +281,7 @@ describe('chat blocks', () => {
           },
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],

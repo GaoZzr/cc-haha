@@ -42,6 +42,7 @@ import {
   type NetworkSettings,
 } from './networkSettings.js'
 import { getProviderUserAgent } from './providerUserAgent.js'
+import { normalizeModelStringForAPI } from '../../utils/model/model.js'
 import type {
   SavedProvider,
   ProvidersIndex,
@@ -53,11 +54,76 @@ import type {
   ApiFormat,
   ProviderAuthStrategy,
 } from '../types/provider.js'
+import {
+  BUILT_IN_PROVIDER_IDS,
+} from '../types/provider.js'
 
 const DEFAULT_INDEX: ProvidersIndex = {
   schemaVersion: CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
   activeId: null,
   providers: [],
+  providerOrder: [...BUILT_IN_PROVIDER_IDS],
+}
+
+function isPermutation(candidateIds: string[], expectedIds: string[]): boolean {
+  const expectedSet = new Set(expectedIds)
+  const candidateSet = new Set(candidateIds)
+  return (
+    candidateIds.length === expectedIds.length &&
+    candidateSet.size === candidateIds.length &&
+    expectedIds.every((id) => candidateSet.has(id)) &&
+    candidateIds.every((id) => expectedSet.has(id))
+  )
+}
+
+function savedProviderIds(providers: SavedProvider[]): string[] {
+  return providers.map((provider) => provider.id)
+}
+
+function fullProviderOrderIds(providers: SavedProvider[]): string[] {
+  return [
+    ...savedProviderIds(providers),
+    ...BUILT_IN_PROVIDER_IDS,
+  ]
+}
+
+function sortSavedProvidersByOrder(providers: SavedProvider[], providerOrder: string[]): SavedProvider[] {
+  const byId = new Map(providers.map((provider) => [provider.id, provider]))
+  return providerOrder
+    .map((id) => byId.get(id))
+    .filter((provider): provider is SavedProvider => provider !== undefined)
+}
+
+function mergeSavedOrderIntoDisplayOrder(providerOrder: string[], savedOrder: string[]): string[] {
+  const savedSet = new Set(savedOrder)
+  const queue = [...savedOrder]
+  return providerOrder.map((id) => {
+    if (!savedSet.has(id)) return id
+    return queue.shift() ?? id
+  })
+}
+
+function appendNewProviderToOrder(providerOrder: string[], providerId: string, existingProviders: SavedProvider[]): string[] {
+  const existingProviderIds = new Set(existingProviders.map((provider) => provider.id))
+  const lastSavedIndex = providerOrder.reduce(
+    (latest, id, index) => existingProviderIds.has(id) ? index : latest,
+    -1,
+  )
+  if (lastSavedIndex !== -1) {
+    return [
+      ...providerOrder.slice(0, lastSavedIndex + 1),
+      providerId,
+      ...providerOrder.slice(lastSavedIndex + 1),
+    ]
+  }
+
+  const firstBuiltInIndex = providerOrder.findIndex((id) => BUILT_IN_PROVIDER_IDS.includes(id as typeof BUILT_IN_PROVIDER_IDS[number]))
+  if (firstBuiltInIndex === -1) return [...providerOrder, providerId]
+  return [
+    ...providerOrder.slice(0, firstBuiltInIndex),
+    providerId,
+    ...providerOrder.slice(firstBuiltInIndex),
+  ]
 }
 
 export class ProviderService {
@@ -125,9 +191,13 @@ export class ProviderService {
 
   // --- CRUD ---
 
-  async listProviders(): Promise<{ providers: SavedProvider[]; activeId: string | null }> {
+  async listProviders(): Promise<{ providers: SavedProvider[]; activeId: string | null; providerOrder: string[] }> {
     const index = await this.readIndex()
-    return { providers: index.providers, activeId: index.activeId }
+    return {
+      providers: index.providers,
+      activeId: index.activeId,
+      providerOrder: index.providerOrder,
+    }
   }
 
   async getProvider(id: string): Promise<SavedProvider> {
@@ -160,6 +230,7 @@ export class ProviderService {
       ...(input.notes !== undefined && { notes: input.notes }),
     }
 
+    index.providerOrder = appendNewProviderToOrder(index.providerOrder, provider.id, index.providers)
     index.providers.push(provider)
     await this.writeIndex(index)
     return provider
@@ -215,7 +286,39 @@ export class ProviderService {
     }
 
     index.providers.splice(idx, 1)
+    index.providerOrder = index.providerOrder.filter((providerId) => providerId !== id)
     await this.writeIndex(index)
+  }
+
+  /**
+   * Reorder providers to match the given display id order.
+   *
+   * New clients send a full display-order permutation including the built-in
+   * official providers. Legacy clients may still send only saved provider ids;
+   * in that case the saved providers are reordered inside the current display
+   * order without moving the built-in official rows.
+   */
+  async reorderProviders(orderedIds: string[]): Promise<{ providers: SavedProvider[]; providerOrder: string[] }> {
+    const index = await this.readIndex()
+
+    const currentSavedIds = savedProviderIds(index.providers)
+    const isFullDisplayPermutation = isPermutation(orderedIds, fullProviderOrderIds(index.providers))
+    const isLegacySavedPermutation = isPermutation(orderedIds, currentSavedIds)
+
+    if (!isFullDisplayPermutation && !isLegacySavedPermutation) {
+      throw ApiError.badRequest('orderedIds must be a permutation of existing provider ids and built-in provider ids')
+    }
+
+    index.providerOrder = isFullDisplayPermutation
+      ? orderedIds
+      : mergeSavedOrderIntoDisplayOrder(index.providerOrder, orderedIds)
+    index.providers = sortSavedProvidersByOrder(index.providers, index.providerOrder)
+    await this.writeIndex(index)
+
+    return {
+      providers: index.providers,
+      providerOrder: index.providerOrder,
+    }
   }
 
   // --- Activation ---
@@ -471,11 +574,12 @@ export class ProviderService {
     const format: ApiFormat = input.apiFormat ?? 'anthropic'
     const authStrategy = input.authStrategy ?? 'api_key'
     const base = input.baseUrl.replace(/\/+$/, '')
+    const modelId = normalizeModelStringForAPI(input.modelId)
     const networkSettings = await loadNetworkSettings()
 
     // ── Step 1: Basic connectivity ───────────────────────────
     // Directly call the upstream API to verify URL, key, and model.
-    const step1 = await this.testConnectivity(base, input.apiKey, input.modelId, format, authStrategy, networkSettings)
+    const step1 = await this.testConnectivity(base, input.apiKey, modelId, format, authStrategy, networkSettings)
 
     // If connectivity failed, no point running step 2
     if (!step1.success) {
@@ -489,7 +593,7 @@ export class ProviderService {
 
     // ── Step 2: Full proxy pipeline ──────────────────────────
     // Anthropic request → transform → upstream → transform back → validate
-    const step2 = await this.testProxyPipeline(base, input.apiKey, input.modelId, format, networkSettings)
+    const step2 = await this.testProxyPipeline(base, input.apiKey, modelId, format, networkSettings)
 
     return { connectivity: step1, proxy: step2 }
   }
@@ -634,7 +738,7 @@ function buildDirectTestRequest(
     return {
       url: `${base}/v1/chat/completions`,
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: { model: modelId, max_tokens: 16, messages: [{ role: 'user', content: prompt }] },
+      body: { model: modelId, max_tokens: 16, stream: false, messages: [{ role: 'user', content: prompt }] },
     }
   }
   if (format === 'openai_responses') {

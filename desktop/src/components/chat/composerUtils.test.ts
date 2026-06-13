@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
+  appendAgentSlashCommands,
+  buildAgentSlashCommands,
   filterSlashCommands,
   findSlashToken,
   getLocalizedFallbackCommands,
@@ -110,6 +112,35 @@ describe('composerUtils', () => {
     expect(mergeSlashCommands([]).map((command) => command.name)).not.toContain('goal --tokens')
   })
 
+  it('builds agent slash entries under the /agent namespace', () => {
+    expect(
+      buildAgentSlashCommands([
+        {
+          agentType: 'debugger',
+          description: 'Debug failures',
+          modelDisplay: 'OPUS',
+          source: 'userSettings',
+        },
+      ]),
+    ).toEqual([
+      {
+        name: 'agent debugger',
+        description: 'Debug failures (OPUS - userSettings)',
+        argumentHint: '<prompt>',
+      },
+    ])
+  })
+
+  it('appends agent entries after normal slash commands without replacing them', () => {
+    const base = mergeSlashCommands([{ name: 'agent', description: 'CLI /agent' }])
+    const withAgents = appendAgentSlashCommands(base, [
+      { name: 'agent debugger', description: 'Debug failures', argumentHint: '<prompt>' },
+    ])
+
+    expect(withAgents.map((command) => command.name).slice(0, 2)).toEqual(['agent', 'mcp'])
+    expect(withAgents.map((command) => command.name)).toContain('agent debugger')
+  })
+
   it('does not replace /goal arguments as slash command fragments', () => {
     expect(replaceSlashCommand('/goal sta', 9, 'goal status')).toBeNull()
   })
@@ -134,9 +165,13 @@ describe('composerUtils', () => {
     expect(resolveSlashUiAction('plugins')).toEqual({ type: 'settings', tab: 'plugins' })
     expect(resolveSlashUiAction('memory')).toEqual({ type: 'settings', tab: 'memory' })
     expect(resolveSlashUiAction('doctor')).toEqual({ type: 'settings', tab: 'diagnostics' })
+    expect(resolveSlashUiAction('config')).toEqual({ type: 'settings', tab: 'general' })
+    expect(resolveSlashUiAction('settings')).toEqual({ type: 'settings', tab: 'general' })
     expect(mergeSlashCommands([]).map((command) => command.name)).toContain('plugin')
     expect(mergeSlashCommands([]).map((command) => command.name)).toContain('memory')
+    expect(mergeSlashCommands([]).map((command) => command.name)).toContain('config')
     expect(mergeSlashCommands([]).map((command) => command.name)).not.toContain('plugins')
+    expect(mergeSlashCommands([]).map((command) => command.name)).not.toContain('settings')
   })
 
   it('routes session inspection commands to the desktop panel', () => {

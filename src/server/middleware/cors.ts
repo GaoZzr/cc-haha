@@ -2,8 +2,6 @@
  * CORS middleware for desktop and temporary open H5 access.
  */
 
-import { isLoopbackHost } from '../h5AccessPolicy.js'
-
 export function corsHeaders(origin?: string | null): Record<string, string> {
   const allowedOrigin = origin || 'http://localhost:3000'
   return {
@@ -35,26 +33,51 @@ export type CorsResolutionOptions = {
   isOriginAllowed?: (origin: string) => Promise<boolean>
 }
 
-const LOCAL_ORIGINS = new Set([
-  'http://tauri.localhost',
-  'https://tauri.localhost',
-  'tauri://localhost',
-])
+const LOCAL_DESKTOP_ORIGINS = new Set(['file://'])
 
 function isLocalOrigin(origin?: string | null): boolean {
   if (!origin) {
     return true
   }
 
-  if (LOCAL_ORIGINS.has(origin)) {
-    return true
-  }
+  return LOCAL_DESKTOP_ORIGINS.has(origin) || isLoopbackBrowserOrigin(origin)
+}
 
+function isLoopbackBrowserOrigin(origin: string): boolean {
+  let parsed: URL
   try {
-    return isLoopbackHost(new URL(origin).hostname)
+    parsed = new URL(origin)
   } catch {
     return false
   }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    return false
+  }
+
+  const hostname = parsed.hostname
+    .trim()
+    .replace(/^\[/, '')
+    .replace(/\]$/, '')
+    .toLowerCase()
+
+  return hostname === 'localhost' || hostname === '::1' || isLoopbackIPv4(hostname)
+}
+
+function isLoopbackIPv4(hostname: string): boolean {
+  const parts = hostname.split('.')
+  if (parts.length !== 4 || parts[0] !== '127') {
+    return false
+  }
+
+  return parts.every((part) => {
+    if (!/^\d+$/.test(part)) {
+      return false
+    }
+
+    const value = Number(part)
+    return value >= 0 && value <= 255
+  })
 }
 
 export async function resolveCors(

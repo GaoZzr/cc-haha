@@ -4,6 +4,8 @@ import {
   SCHEDULED_TAB_ID,
   SETTINGS_TAB_ID,
   TERMINAL_TAB_PREFIX,
+  TRACE_LIST_TAB_ID,
+  TRACE_TAB_PREFIX,
   useTabStore,
   type Tab,
 } from '../../stores/tabStore'
@@ -12,6 +14,7 @@ import { useSessionStore } from '../../stores/sessionStore'
 import { useWorkspacePanelStore } from '../../stores/workspacePanelStore'
 import { useTerminalPanelStore } from '../../stores/terminalPanelStore'
 import { useTranslation } from '../../i18n'
+import { getDesktopHost } from '../../lib/desktopHost'
 import { WindowControls, showWindowControls } from './WindowControls'
 import { OpenProjectMenu } from './OpenProjectMenu'
 import { Folder, FolderOpen, SquareTerminal } from 'lucide-react'
@@ -19,7 +22,8 @@ import { ActionDialog } from '../shared/ActionDialog'
 
 const TAB_WIDTH = 180
 const DRAG_START_THRESHOLD = 4
-const isTauri = typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
+const desktopHost = getDesktopHost()
+const isDesktopRuntime = desktopHost.isDesktop
 
 type PendingCloseRequest = {
   tabs: Tab[]
@@ -38,7 +42,9 @@ function isSessionTabId(tabId: string | null) {
   if (!tabId) return false
   return tabId !== SETTINGS_TAB_ID &&
     tabId !== SCHEDULED_TAB_ID &&
-    !tabId.startsWith(TERMINAL_TAB_PREFIX)
+    tabId !== TRACE_LIST_TAB_ID &&
+    !tabId.startsWith(TERMINAL_TAB_PREFIX) &&
+    !tabId.startsWith(TRACE_TAB_PREFIX)
 }
 
 export function TabBar() {
@@ -89,7 +95,6 @@ export function TabBar() {
   const pendingDragRef = useRef<{ index: number; startX: number; startY: number } | null>(null)
   const suppressClickRef = useRef(false)
   const tabRefs = useRef(new Map<string, HTMLDivElement | null>())
-  const startDraggingRef = useRef<(() => Promise<void>) | null>(null)
   const t = useTranslation()
   const runningSessionIds = useMemo(() => {
     const ids = new Set<string>()
@@ -101,16 +106,6 @@ export function TabBar() {
     }
     return ids
   }, [activeChatSessionIds, tabs])
-
-  useEffect(() => {
-    if (!isTauri) return
-    import('@tauri-apps/api/window')
-      .then(({ getCurrentWindow }) => {
-        const win = getCurrentWindow()
-        startDraggingRef.current = () => win.startDragging()
-      })
-      .catch(() => {})
-  }, [])
 
   const updateScrollState = useCallback(() => {
     const el = scrollRef.current
@@ -328,16 +323,10 @@ export function TabBar() {
     setActiveTab(sessionId)
   }
 
-  const handleScrollRegionMouseDown = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
-    if (event.button !== 0 || event.target !== scrollRef.current) return
-    const startDragging = startDraggingRef.current
-    if (!startDragging) return
-    void startDragging().catch(() => {})
-  }, [])
-
   return (
     <div
       data-testid="tab-bar"
+      data-desktop-drag-region={isDesktopRuntime ? true : undefined}
       className="flex min-h-11 items-stretch bg-[var(--color-surface-container)] select-none border-b border-[var(--color-border)]"
     >
 
@@ -349,9 +338,10 @@ export function TabBar() {
 
       <div
         ref={scrollRef}
-        className="tab-bar-hit-area flex-1 flex items-stretch overflow-x-hidden"
+        data-testid="tab-bar-scroll-region"
+        data-desktop-drag-region={isDesktopRuntime ? true : undefined}
+        className="flex-1 flex items-stretch overflow-x-hidden"
         onDragOver={(e) => e.preventDefault()}
-        onMouseDown={handleScrollRegionMouseDown}
       >
         {tabs.map((tab, index) => (
           <TabItem
@@ -373,7 +363,7 @@ export function TabBar() {
       </div>
 
       <div className="flex shrink-0 items-center gap-1 border-l border-[var(--color-border)]/70 px-2">
-        {isTauri && isActiveSessionTab && (
+        {isDesktopRuntime && isActiveSessionTab && (
           <OpenProjectMenu path={openProjectPath} />
         )}
         <ToolbarIconButton
@@ -406,10 +396,10 @@ export function TabBar() {
         )}
       </div>
 
-      {isTauri && (
+      {isDesktopRuntime && (
         <div
           data-testid="tab-bar-drag-gutter"
-          data-tauri-drag-region
+          data-desktop-drag-region
           aria-hidden="true"
           className={`min-h-11 flex-shrink-0 ${showWindowControls ? 'w-3' : 'w-4'}`}
         />
@@ -524,7 +514,7 @@ const TabItem = forwardRef<HTMLDivElement, {
       onMouseDown={onMouseDown}
       onContextMenu={onContextMenu}
       className={`
-        tab-bar-hit-area group relative flex min-h-11 flex-shrink-0 items-center gap-1.5 px-3
+        tab-bar-interactive group relative flex min-h-11 flex-shrink-0 items-center gap-1.5 px-3
         ${isDragging ? 'z-20 cursor-grabbing' : 'cursor-grab'}
         transition-[background-color,box-shadow,opacity,transform] duration-150 ease-out
         ${isActive

@@ -8,23 +8,70 @@ import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
+import { fileURLToPath } from 'node:url'
 
 let server: ReturnType<typeof Bun.serve>
 let baseUrl: string
 let tmpDir: string
+const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+const originalCliPath = process.env.CLAUDE_CLI_PATH
+const originalDisableTerminalShellEnv = process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV
+const mockSdkCliPath = fileURLToPath(new URL('../fixtures/mock-sdk-cli.ts', import.meta.url))
+
+// The models API derives its model list from these env vars (see
+// src/server/api/models.ts getEnvConfiguredAnthropicModels). A developer who
+// exports them for a custom provider would otherwise leak them into the
+// no-provider fixture and break the default-model assertions. Isolate them.
+const MODEL_ENV_KEYS = [
+  'ANTHROPIC_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+] as const
+const originalModelEnv = Object.fromEntries(
+  MODEL_ENV_KEYS.map((key) => [key, process.env[key]]),
+) as Record<(typeof MODEL_ENV_KEYS)[number], string | undefined>
+
+function restoreEnv() {
+  for (const key of MODEL_ENV_KEYS) {
+    if (originalModelEnv[key] !== undefined) process.env[key] = originalModelEnv[key]
+    else delete process.env[key]
+  }
+  if (originalConfigDir !== undefined) {
+    process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+  } else {
+    delete process.env.CLAUDE_CONFIG_DIR
+  }
+  if (originalCliPath !== undefined) {
+    process.env.CLAUDE_CLI_PATH = originalCliPath
+  } else {
+    delete process.env.CLAUDE_CLI_PATH
+  }
+  if (originalDisableTerminalShellEnv !== undefined) {
+    process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV = originalDisableTerminalShellEnv
+  } else {
+    delete process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV
+  }
+}
+
+afterAll(() => {
+  restoreEnv()
+})
 
 // Use dynamic import to avoid bundling issues
 async function startTestServer() {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-e2e-'))
   process.env.CLAUDE_CONFIG_DIR = tmpDir
+  process.env.CLAUDE_CLI_PATH = mockSdkCliPath
+  process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV = '1'
+  for (const key of MODEL_ENV_KEYS) delete process.env[key]
 
   // Create required directories
   await fs.mkdir(path.join(tmpDir, 'projects'), { recursive: true })
 
   const { startServer } = await import('../../index.js')
-  const port = 13456 + Math.floor(Math.random() * 1000)
-  server = startServer(port, '127.0.0.1')
-  baseUrl = `http://127.0.0.1:${port}`
+  server = startServer(0, '127.0.0.1')
+  baseUrl = `http://127.0.0.1:${server.port}`
 }
 
 async function api(method: string, path: string, body?: unknown): Promise<{ status: number; data: any }> {
@@ -158,7 +205,7 @@ describe('E2E: Full Flow', () => {
 
   it('should list available models', async () => {
     const { data } = await api('GET', '/api/models')
-    expect(data.models.length).toBe(4)
+    expect(data.models.length).toBe(3)
     expect(data.models[0].name).toBe('Opus 4.7')
   })
 
@@ -332,13 +379,22 @@ describe('E2E: Full Flow', () => {
   // 10. CORS
   // =============================================
 
-  it('should handle CORS preflight', async () => {
+  // Loopback browser origins (local dev servers) are trusted without a token
+  // since 9238481e; only remote origins stay blocked while H5 is disabled.
+  it('should allow loopback browser CORS preflight while H5 access is disabled', async () => {
     const res = await fetch(`${baseUrl}/api/status`, {
       method: 'OPTIONS',
       headers: { 'Origin': 'http://localhost:3000' },
     })
     expect(res.status).toBe(204)
-    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('http://localhost:3000')
+  })
+
+  it('should block remote browser CORS preflight while H5 access is disabled', async () => {
+    const res = await fetch(`${baseUrl}/api/status`, {
+      method: 'OPTIONS',
+      headers: { 'Origin': 'https://phone.example' },
+    })
+    expect(res.status).toBe(403)
   })
 
   // =============================================

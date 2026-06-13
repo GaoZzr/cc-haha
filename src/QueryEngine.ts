@@ -69,6 +69,7 @@ import {
 import { loadAllPluginsCacheOnly } from './utils/plugins/pluginLoader.js'
 import {
   type ProcessUserInputContext,
+  type ProcessUserInputBaseResult,
   processUserInput,
 } from './utils/processUserInput/processUserInput.js'
 import { fetchSystemPromptParts } from './utils/queryContext.js'
@@ -415,7 +416,7 @@ export class QueryEngine {
       allowedTools,
       model: modelFromUserInput,
       resultText,
-    } = await processUserInput({
+    }: ProcessUserInputBaseResult = await processUserInput({
       input: prompt,
       mode: 'prompt',
       setToolJSX: () => {},
@@ -980,6 +981,15 @@ export class QueryEngine {
               retry_delay_ms: message.retryInMs,
               error_status: message.error.status ?? null,
               error: categorizeRetryableAPIError(message.error),
+              session_id: getSessionId(),
+              uuid: message.uuid,
+            }
+          }
+          if (message.subtype === 'streaming_fallback') {
+            yield {
+              type: 'system',
+              subtype: 'streaming_fallback' as const,
+              cause: message.cause,
               session_id: getSessionId(),
               uuid: message.uuid,
             }

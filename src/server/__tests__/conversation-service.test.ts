@@ -3,10 +3,12 @@ import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {
+  buildConversationCliSpawnOptions,
   ConversationService,
   DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
 } from '../services/conversationService.js'
 import { ProviderService } from '../services/providerService.js'
+import { updateTraceCaptureSettings } from '../services/traceCaptureService.js'
 import { resetTerminalShellEnvironmentCacheForTests } from '../../utils/terminalShellEnvironment.js'
 
 describe('ConversationService', () => {
@@ -21,6 +23,11 @@ describe('ConversationService', () => {
   let originalProviderManagedByHost: string | undefined
   let originalDiagnosticsFile: string | undefined
   let originalAttributionHeader: string | undefined
+  let originalResumeInterruptedTurn: string | undefined
+  let originalTraceApiCalls: string | undefined
+  let originalTraceProviderId: string | undefined
+  let originalTraceProviderName: string | undefined
+  let originalTraceProviderFormat: string | undefined
   let originalHome: string | undefined
   let originalPath: string | undefined
   let originalShell: string | undefined
@@ -39,6 +46,11 @@ describe('ConversationService', () => {
     originalProviderManagedByHost = process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
     originalDiagnosticsFile = process.env.CLAUDE_CODE_DIAGNOSTICS_FILE
     originalAttributionHeader = process.env.CLAUDE_CODE_ATTRIBUTION_HEADER
+    originalResumeInterruptedTurn = process.env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN
+    originalTraceApiCalls = process.env.CC_HAHA_TRACE_API_CALLS
+    originalTraceProviderId = process.env.CC_HAHA_TRACE_PROVIDER_ID
+    originalTraceProviderName = process.env.CC_HAHA_TRACE_PROVIDER_NAME
+    originalTraceProviderFormat = process.env.CC_HAHA_TRACE_PROVIDER_FORMAT
     originalHome = process.env.HOME
     originalPath = process.env.PATH
     originalShell = process.env.SHELL
@@ -57,6 +69,11 @@ describe('ConversationService', () => {
     delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
     delete process.env.CLAUDE_CODE_DIAGNOSTICS_FILE
     delete process.env.CLAUDE_CODE_ATTRIBUTION_HEADER
+    delete process.env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN
+    delete process.env.CC_HAHA_TRACE_API_CALLS
+    delete process.env.CC_HAHA_TRACE_PROVIDER_ID
+    delete process.env.CC_HAHA_TRACE_PROVIDER_NAME
+    delete process.env.CC_HAHA_TRACE_PROVIDER_FORMAT
     process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV = '1'
     resetTerminalShellEnvironmentCacheForTests()
   })
@@ -91,6 +108,21 @@ describe('ConversationService', () => {
 
     if (originalAttributionHeader === undefined) delete process.env.CLAUDE_CODE_ATTRIBUTION_HEADER
     else process.env.CLAUDE_CODE_ATTRIBUTION_HEADER = originalAttributionHeader
+
+    if (originalResumeInterruptedTurn === undefined) delete process.env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN
+    else process.env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN = originalResumeInterruptedTurn
+
+    if (originalTraceApiCalls === undefined) delete process.env.CC_HAHA_TRACE_API_CALLS
+    else process.env.CC_HAHA_TRACE_API_CALLS = originalTraceApiCalls
+
+    if (originalTraceProviderId === undefined) delete process.env.CC_HAHA_TRACE_PROVIDER_ID
+    else process.env.CC_HAHA_TRACE_PROVIDER_ID = originalTraceProviderId
+
+    if (originalTraceProviderName === undefined) delete process.env.CC_HAHA_TRACE_PROVIDER_NAME
+    else process.env.CC_HAHA_TRACE_PROVIDER_NAME = originalTraceProviderName
+
+    if (originalTraceProviderFormat === undefined) delete process.env.CC_HAHA_TRACE_PROVIDER_FORMAT
+    else process.env.CC_HAHA_TRACE_PROVIDER_FORMAT = originalTraceProviderFormat
 
     if (originalHome === undefined) delete process.env.HOME
     else process.env.HOME = originalHome
@@ -148,6 +180,19 @@ describe('ConversationService', () => {
       `${path.join(tmpDir, 'projects', 'D--workspace-code-myself-code-cc-haha', 'memory')}${path.sep}`,
     )
     await expect(fs.stat(path.dirname(env.CLAUDE_CODE_DIAGNOSTICS_FILE))).resolves.toBeTruthy()
+  })
+
+  test('builds hidden CLI spawn options for desktop session subprocesses', () => {
+    const env = { CLAUDECODE: '1' }
+
+    expect(buildConversationCliSpawnOptions('/workspace/project', env)).toEqual({
+      cwd: '/workspace/project',
+      env,
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+      windowsHide: true,
+    })
   })
 
   test('buildChildEnv pins desktop memory to the current sanitized project directory', async () => {
@@ -260,6 +305,51 @@ describe('ConversationService', () => {
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('haha-fresh-token')
   })
 
+  test('sendMessage updates a running official OAuth CLI token before the user turn', async () => {
+    const { hahaOAuthService } = await import('../services/hahaOAuthService.js')
+    await hahaOAuthService.saveTokens({
+      accessToken: 'fresh-after-wake-token',
+      refreshToken: 'refresh-xxx',
+      expiresAt: Date.now() + 30 * 60_000,
+      scopes: ['user:inference'],
+      subscriptionType: 'max',
+    })
+
+    const service = new ConversationService() as any
+    const sent: string[] = []
+    service.sessions.set('sleep-wake-session', {
+      proc: {},
+      outputCallbacks: [],
+      workDir: tmpDir,
+      permissionMode: 'default',
+      sdkToken: 'sdk-token',
+      sdkSocket: {
+        send(line: string) {
+          sent.push(line)
+        },
+      },
+      pendingOutbound: [],
+      startupPending: false,
+      startupExitCode: null,
+      stdoutLines: [],
+      stderrLines: [],
+      outputDrain: Promise.resolve(),
+      sdkMessages: [],
+      initMessage: null,
+      pendingPermissionRequests: new Map(),
+      usesOfficialOAuth: true,
+      officialOAuthToken: 'stale-before-sleep-token',
+    })
+
+    const ok = await service.sendMessage('sleep-wake-session', 'hello after wake')
+
+    expect(ok).toBe(true)
+    expect(sent).toHaveLength(2)
+    expect(JSON.parse(sent[0]!).type).toBe('update_environment_variables')
+    expect(JSON.parse(sent[0]!).variables.CLAUDE_CODE_OAUTH_TOKEN).toBe('fresh-after-wake-token')
+    expect(JSON.parse(sent[1]!).type).toBe('user')
+  })
+
   test('buildChildEnv does NOT inject CLAUDE_CODE_OAUTH_TOKEN when not official mode', async () => {
     const ccHahaDir = path.join(tmpDir, 'cc-haha')
     await fs.mkdir(ccHahaDir, { recursive: true })
@@ -315,6 +405,68 @@ describe('ConversationService', () => {
     expect(env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST).toBe('1')
     expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
     expect(env.CLAUDE_CODE_ENTRYPOINT).toBeUndefined()
+    expect(env.CC_HAHA_TRACE_PROVIDER_ID).toBeUndefined()
+    expect(env.CC_HAHA_TRACE_PROVIDER_NAME).toBeUndefined()
+    expect(env.CC_HAHA_TRACE_PROVIDER_FORMAT).toBeUndefined()
+  })
+
+  test('buildChildEnv injects trace provider metadata for desktop sdk session-scoped providers', async () => {
+    const providerService = new ProviderService()
+    const provider = await providerService.addProvider({
+      presetId: 'custom',
+      name: 'Traceable Provider',
+      apiKey: 'provider-key',
+      baseUrl: 'https://traceable.example',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'gpt-5.5',
+        haiku: '',
+        sonnet: '',
+        opus: '',
+      },
+    })
+
+    const service = new ConversationService() as any
+    const env = (await service.buildChildEnv(
+      '/tmp',
+      'ws://127.0.0.1:3456/sdk/test-session?token=test-token',
+      { providerId: provider.id },
+    )) as Record<string, string>
+
+    expect(env.CC_HAHA_TRACE_API_CALLS).toBe('1')
+    expect(env.CC_HAHA_TRACE_PROVIDER_ID).toBe(provider.id)
+    expect(env.CC_HAHA_TRACE_PROVIDER_NAME).toBe('Traceable Provider')
+    expect(env.CC_HAHA_TRACE_PROVIDER_FORMAT).toBe('anthropic')
+  })
+
+  test('buildChildEnv does not inject trace env when managed trace capture is disabled', async () => {
+    await updateTraceCaptureSettings({ enabled: false })
+    const providerService = new ProviderService()
+    const provider = await providerService.addProvider({
+      presetId: 'custom',
+      name: 'Trace disabled provider',
+      apiKey: 'provider-key',
+      baseUrl: 'https://traceable.example',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'gpt-5.5',
+        haiku: '',
+        sonnet: '',
+        opus: '',
+      },
+    })
+
+    const service = new ConversationService() as any
+    const env = (await service.buildChildEnv(
+      '/tmp',
+      'ws://127.0.0.1:3456/sdk/test-session?token=test-token',
+      { providerId: provider.id },
+    )) as Record<string, string>
+
+    expect(env.CC_HAHA_TRACE_API_CALLS).toBeUndefined()
+    expect(env.CC_HAHA_TRACE_PROVIDER_ID).toBeUndefined()
+    expect(env.CC_HAHA_TRACE_PROVIDER_NAME).toBeUndefined()
+    expect(env.CC_HAHA_TRACE_PROVIDER_FORMAT).toBeUndefined()
   })
 
   test('buildChildEnv uses the session-selected model for session-scoped providers', async () => {
@@ -510,6 +662,7 @@ describe('ConversationService', () => {
       'com.claude-code-haha.desktop',
     )
     expect(env.CC_HAHA_DESKTOP_SERVER_URL).toBe('http://127.0.0.1:3456')
+    expect(env.CC_HAHA_TRACE_API_CALLS).toBe('1')
     expect(env.CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING).toBe('1')
   })
 
@@ -552,6 +705,18 @@ describe('ConversationService', () => {
     expect(env.CC_HAHA_DESKTOP_AWAIT_MCP_TIMEOUT_MS).toBe('5000')
   })
 
+  test('buildChildEnv disables inherited interrupted-turn resume for prewarm launches', async () => {
+    process.env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN = '1'
+    const service = new ConversationService() as any
+    const env = (await service.buildChildEnv(
+      '/tmp',
+      'ws://127.0.0.1:3456/sdk/test-session?token=test-token',
+      { resumeInterruptedTurn: false },
+    )) as Record<string, string>
+
+    expect(env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN).toBeUndefined()
+  })
+
   test('buildChildEnv enables stream idle watchdog for desktop CLI sessions', async () => {
     const service = new ConversationService() as any
     const env = (await service.buildChildEnv(
@@ -560,6 +725,52 @@ describe('ConversationService', () => {
     )) as Record<string, string>
 
     expect(env.CLAUDE_ENABLE_STREAM_WATCHDOG).toBe('1')
+  })
+
+  test('buildChildEnv widens the stream idle window and disables the non-streaming fallback (#766)', async () => {
+    const service = new ConversationService() as any
+    const env = (await service.buildChildEnv(
+      '/tmp',
+      'ws://127.0.0.1:3456/sdk/test-session?token=test-token',
+    )) as Record<string, string>
+
+    // 90s default kills healthy-but-silent third-party streams; 240s keeps the
+    // watchdog useful without aborting slow thinking/prefill phases.
+    expect(env.CLAUDE_STREAM_IDLE_TIMEOUT_MS).toBe('240000')
+    // Non-streaming fallback can never finish for slow providers (first byte
+    // only arrives after FULL generation), so retries must stay streaming.
+    expect(env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK).toBe('1')
+  })
+
+  test('buildChildEnv respects caller overrides for stream timeout tuning envs', async () => {
+    const service = new ConversationService() as any
+    const previous = {
+      watchdog: process.env.CLAUDE_ENABLE_STREAM_WATCHDOG,
+      idle: process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS,
+      fallback: process.env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK,
+    }
+    process.env.CLAUDE_ENABLE_STREAM_WATCHDOG = '0'
+    process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS = '90000'
+    process.env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK = '0'
+    try {
+      const env = (await service.buildChildEnv(
+        '/tmp',
+        'ws://127.0.0.1:3456/sdk/test-session?token=test-token',
+      )) as Record<string, string>
+
+      expect(env.CLAUDE_ENABLE_STREAM_WATCHDOG).toBe('0')
+      expect(env.CLAUDE_STREAM_IDLE_TIMEOUT_MS).toBe('90000')
+      expect(env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK).toBe('0')
+    } finally {
+      for (const [key, value] of [
+        ['CLAUDE_ENABLE_STREAM_WATCHDOG', previous.watchdog],
+        ['CLAUDE_STREAM_IDLE_TIMEOUT_MS', previous.idle],
+        ['CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK', previous.fallback],
+      ] as const) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
   })
 
   test('buildSessionCliArgs forwards the selected runtime model and effort to the CLI process', () => {

@@ -41,6 +41,20 @@ export type TaskRun = {
   sessionId?: string // links to a session for rich output rendering
 }
 
+export function buildCronTaskSpawnOptions(
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+) {
+  return {
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    cwd,
+    env,
+    windowsHide: true,
+  } as const
+}
+
 // ─── Output extraction ────────────────────────────────────────────────────────
 
 /**
@@ -368,6 +382,9 @@ export class CronScheduler {
 
   /** Stop the scheduler and kill any running task processes. */
   stop(): void {
+    const wasRunning = this.intervalId !== null || this.runningTasks.size > 0
+    if (!wasRunning) return
+
     if (this.intervalId) {
       clearInterval(this.intervalId)
       this.intervalId = null
@@ -515,13 +532,7 @@ export class CronScheduler {
     const childEnv = await this.buildTaskChildEnv(workDir, task)
     const proc = Bun.spawn(
       cliArgs,
-      {
-        stdin: 'pipe',
-        stdout: 'pipe',
-        stderr: 'pipe',
-        cwd: workDir,
-        env: childEnv,
-      },
+      buildCronTaskSpawnOptions(workDir, childEnv),
     )
 
     this.runningTasks.set(task.id, { proc, startedAt: Date.now(), runId })

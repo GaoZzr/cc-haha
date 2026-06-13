@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import '@testing-library/jest-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useUIStore } from '../../stores/uiStore'
@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   restoreTabs: vi.fn(),
   connectToSession: vi.fn(),
   setActiveTab: vi.fn(),
+  openTab: vi.fn(),
+  openTraceTab: vi.fn(),
   tabState: {
     activeTabId: null as string | null,
     tabs: [] as Array<{ sessionId: string; title: string; type: string; status: string }>,
@@ -21,6 +23,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../../lib/desktopRuntime', () => ({
   initializeDesktopServerUrl: mocks.initializeDesktopServerUrl,
   isTauriRuntime: () => mocks.isTauriRuntime,
+  isDesktopRuntime: () => mocks.isTauriRuntime,
   isH5ConnectionRequiredError: (error: unknown) =>
     error instanceof Error && error.name === 'H5ConnectionRequiredError',
 }))
@@ -48,7 +51,8 @@ vi.mock('../../stores/tabStore', () => {
     restoreTabs: mocks.restoreTabs,
     activeTabId: mocks.tabState.activeTabId,
     tabs: mocks.tabState.tabs,
-    openTab: vi.fn(),
+    openTab: mocks.openTab,
+    openTraceTab: mocks.openTraceTab,
     setActiveTab: mocks.setActiveTab,
   })
   useTabStore.setState = (next: { activeTabId?: string | null }) => {
@@ -98,6 +102,14 @@ vi.mock('./H5ConnectionView', () => ({
   ),
 }))
 
+vi.mock('../../pages/TraceSession', () => ({
+  TraceSession: ({ sessionId, standalone }: { sessionId: string; standalone?: boolean }) => (
+    <section data-standalone={standalone ? 'true' : 'false'} data-testid="trace-session">
+      trace:{sessionId}
+    </section>
+  ),
+}))
+
 vi.mock('../shared/Toast', () => ({
   ToastContainer: () => null,
 }))
@@ -116,6 +128,8 @@ describe('AppShell boot flow', () => {
     mocks.initializeDesktopServerUrl.mockResolvedValue('http://127.0.0.1:3456')
     mocks.fetchAll.mockResolvedValue(undefined)
     mocks.restoreTabs.mockResolvedValue(undefined)
+    mocks.openTab.mockReset()
+    mocks.openTraceTab.mockReset()
     mocks.setActiveTab.mockImplementation((sessionId: string) => {
       mocks.tabState.activeTabId = sessionId
     })
@@ -123,6 +137,8 @@ describe('AppShell boot flow', () => {
     mocks.tabState.tabs = []
     useSessionStore.setState({ sessions: [], activeSessionId: null, isLoading: false, error: null })
     useUIStore.setState({ sidebarOpen: true })
+    Reflect.deleteProperty(window, 'desktopHost')
+    window.history.pushState({}, '', '/')
   })
 
   it('renders the desktop chrome after server and settings bootstrap', async () => {
@@ -175,6 +191,59 @@ describe('AppShell boot flow', () => {
     await waitFor(() => {
       expect(mocks.connectToSession).toHaveBeenCalledWith('session-1')
     })
+  })
+
+  it('opens a trace tab from a session-scoped trace deep link', async () => {
+    window.history.pushState({}, '', '/?traceSessionId=session-deep-link')
+
+    render(<AppShell />)
+
+    await screen.findByText('sidebar loaded')
+    await waitFor(() => {
+      expect(mocks.openTraceTab).toHaveBeenCalledWith(
+        'session-deep-link',
+        'Trace: session-',
+      )
+    })
+    expect(mocks.connectToSession).not.toHaveBeenCalled()
+  })
+
+  it('renders a dedicated trace window shell from traceWindow deep links', async () => {
+    window.history.pushState({}, '', '/?traceWindow=1&traceSessionId=session-window')
+
+    render(<AppShell />)
+
+    expect(await screen.findByTestId('trace-session')).toHaveTextContent('trace:session-window')
+    expect(screen.getByTestId('trace-session')).toHaveAttribute('data-standalone', 'true')
+    expect(screen.queryByText('sidebar loaded')).not.toBeInTheDocument()
+    expect(mocks.restoreTabs).not.toHaveBeenCalled()
+  })
+
+  it('routes native menu navigation through the desktop host', async () => {
+    let navigate: ((target: string) => void) | undefined
+    const unlisten = vi.fn()
+    const onNativeMenuNavigate = vi.fn((handler: (target: string) => void) => {
+      navigate = handler
+      return Promise.resolve(unlisten)
+    })
+    window.desktopHost = {
+      isDesktop: true,
+      window: {
+        onNativeMenuNavigate,
+      },
+    } as any
+
+    render(<AppShell />)
+
+    await screen.findByText('sidebar loaded')
+    await waitFor(() => expect(onNativeMenuNavigate).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      navigate?.('about')
+    })
+
+    expect(useUIStore.getState().pendingSettingsTab).toBe('about')
+    expect(mocks.openTab).toHaveBeenCalledWith('__settings__', 'Settings', 'settings')
   })
 
   it('shows the H5 connection view in browser mode when startup needs H5 auth', async () => {

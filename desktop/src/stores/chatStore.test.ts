@@ -129,6 +129,7 @@ import { sessionsApi } from '../api/sessions'
 import {
   mapHistoryMessagesToUiMessages,
   reconstructAgentNotifications,
+  stripGeneratedImageMetadataLines,
   type PerSessionState,
   useChatStore,
 } from './chatStore'
@@ -151,6 +152,7 @@ function makeSession(overrides: Partial<PerSessionState> = {}): PerSessionState 
     pendingPermission: null,
     pendingComputerUsePermission: null,
     tokenUsage: { input_tokens: 0, output_tokens: 0 },
+    streamingResponseChars: 0,
     elapsedSeconds: 0,
     statusVerb: '',
     apiRetry: null,
@@ -161,6 +163,28 @@ function makeSession(overrides: Partial<PerSessionState> = {}): PerSessionState 
     ...overrides,
   }
 }
+
+describe('stripGeneratedImageMetadataLines', () => {
+  it('removes simple, detailed, and resize metadata lines but keeps the prompt body', () => {
+    const text = [
+      'first line of the prompt',
+      'second line',
+      '[Image source: C:\\Users\\Relakkes\\.claude\\uploads\\sid\\a.png]',
+      '[Image: source: /Users/me/.claude/uploads/sid/b.png, original 1024x768, displayed at 512x384. Multiply coordinates by 2 to map to original image.]',
+      '[Image: original 800x600, displayed at 400x300. Multiply coordinates by 2 to map to original image.]',
+    ].join('\n')
+    expect(stripGeneratedImageMetadataLines(text)).toBe('first line of the prompt\nsecond line')
+  })
+
+  it('normalizes CRLF and leaves metadata-free text untouched', () => {
+    expect(stripGeneratedImageMetadataLines('a\r\nb\r\n')).toBe('a\nb')
+    expect(stripGeneratedImageMetadataLines('just a normal prompt')).toBe('just a normal prompt')
+  })
+
+  it('returns empty string when the text is only metadata', () => {
+    expect(stripGeneratedImageMetadataLines('[Image source: /tmp/x.png]')).toBe('')
+  })
+})
 
 describe('chatStore history mapping', () => {
   beforeEach(() => {
@@ -435,6 +459,184 @@ describe('chatStore history mapping', () => {
       },
       {
         type: 'tool_use',
+      },
+    ])
+  })
+
+  it('restores persisted image user messages as renderable attachments without exposing image metadata text', () => {
+    const messages: MessageEntry[] = [
+      {
+        id: 'image-user-1',
+        type: 'user',
+        timestamp: '2026-06-04T08:07:15.803Z',
+        content: [
+          { type: 'text', text: '解释一下这张图片讲了什么东西' },
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/jpeg',
+              data: 'JPEGBASE64',
+            },
+          },
+          {
+            type: 'text',
+            text: '[Image source: /Users/test/.claude/uploads/session-1/pasted-image.jpeg]',
+          },
+        ],
+      },
+    ]
+
+    const mapped = mapHistoryMessagesToUiMessages(messages)
+
+    expect(mapped).toMatchObject([
+      {
+        id: 'image-user-1',
+        type: 'user_text',
+        content: '解释一下这张图片讲了什么东西',
+        modelContent: [
+          '解释一下这张图片讲了什么东西',
+          '[Image source: /Users/test/.claude/uploads/session-1/pasted-image.jpeg]',
+        ].join('\n'),
+        attachments: [{
+          type: 'image',
+          name: 'pasted-image.jpeg',
+          path: '/Users/test/.claude/uploads/session-1/pasted-image.jpeg',
+          data: 'data:image/jpeg;base64,JPEGBASE64',
+          mimeType: 'image/jpeg',
+        }],
+      },
+    ])
+  })
+
+  it('restores multiple persisted images with their matching source paths in order', () => {
+    const mapped = mapHistoryMessagesToUiMessages([
+      {
+        id: 'multi-image-user-1',
+        type: 'user',
+        timestamp: '2026-06-04T08:07:15.803Z',
+        content: [
+          { type: 'text', text: '对比这两张图' },
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/jpeg',
+              data: 'FIRSTJPEG',
+            },
+          },
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/png',
+              data: 'SECONDPNG',
+            },
+          },
+          {
+            type: 'text',
+            text: '[Image source: /Users/test/.claude/uploads/session-1/first-pasted-image.jpeg]',
+          },
+          {
+            type: 'text',
+            text: '[Image source: /Users/test/.claude/uploads/session-1/second-pasted-image.png]',
+          },
+        ],
+      },
+    ])
+
+    expect(mapped).toMatchObject([
+      {
+        id: 'multi-image-user-1',
+        type: 'user_text',
+        content: '对比这两张图',
+        attachments: [
+          {
+            type: 'image',
+            name: 'first-pasted-image.jpeg',
+            path: '/Users/test/.claude/uploads/session-1/first-pasted-image.jpeg',
+            data: 'data:image/jpeg;base64,FIRSTJPEG',
+            mimeType: 'image/jpeg',
+          },
+          {
+            type: 'image',
+            name: 'second-pasted-image.png',
+            path: '/Users/test/.claude/uploads/session-1/second-pasted-image.png',
+            data: 'data:image/png;base64,SECONDPNG',
+            mimeType: 'image/png',
+          },
+        ],
+      },
+    ])
+  })
+
+  it('keeps image-looking text visible when history has no image block', () => {
+    const mapped = mapHistoryMessagesToUiMessages([
+      {
+        id: 'plain-text-user-1',
+        type: 'user',
+        timestamp: '2026-06-04T08:07:15.803Z',
+        content: [
+          { type: 'text', text: '[Image source: /tmp/example.png]' },
+        ],
+      },
+    ])
+
+    expect(mapped).toMatchObject([
+      {
+        id: 'plain-text-user-1',
+        type: 'user_text',
+        content: '[Image source: /tmp/example.png]',
+      },
+    ])
+  })
+
+  it('restores visual selection history as annotated screenshot attachment without exposing model prompt', () => {
+    const modelPrompt = [
+      '请根据截图中编号 1 的蓝色标注修改本地前端。',
+      '目标元素：<time>',
+      'Selector：#root > main > section > ol > li:nth-of-type(1) > article > div:nth-of-type(1) > time',
+      'DOM 路径：body:nth-child(2) > div:nth-child(1) > main:nth-child(1) > section:nth-child(1) > ol:nth-child(4) > li:nth-child(1) > article:nth-child(1) > div:nth-child(3) > time:nth-child(2)',
+      '页面标题：Todo Desk Board',
+      '页面 URL：http://127.0.0.1:47931/',
+      '当前文本：06/10 21:12',
+      '用户注释：',
+      '这里的时间加上年份',
+      '请优先依据截图里的编号标注定位元素，selector 只作为辅助线索。',
+    ].join('\n')
+
+    const mapped = mapHistoryMessagesToUiMessages([
+      {
+        id: 'selection-user-1',
+        type: 'user',
+        timestamp: '2026-06-10T16:20:00.000Z',
+        content: [
+          { type: 'text', text: modelPrompt },
+          {
+            type: 'image',
+            source: {
+              media_type: 'image/png',
+              data: 'SELECTIONPNG',
+            },
+          },
+        ],
+      } as MessageEntry,
+    ])
+
+    expect(mapped).toMatchObject([
+      {
+        id: 'selection-user-1',
+        type: 'user_text',
+        content: '',
+        modelContent: modelPrompt,
+        attachments: [{
+          type: 'image',
+          name: '<time>',
+          data: 'data:image/png;base64,SELECTIONPNG',
+          mimeType: 'image/png',
+          note: '这里的时间加上年份',
+          quote: '#root > main > section > ol > li:nth-of-type(1) > article > div:nth-of-type(1) > time',
+        }],
       },
     ])
   })
@@ -1114,6 +1316,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -1183,6 +1386,56 @@ describe('chatStore history mapping', () => {
     )
   })
 
+  it('keeps queued message model context when editing the visible prompt text', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'streaming',
+        }),
+      },
+    })
+
+    const id = useChatStore.getState().queueUserMessage(TEST_SESSION_ID, {
+      content: 'Referenced workspace context:\n@"src/App.tsx:L4":\n```tsx\nconst value = 1\n```\n\nfix this',
+      attachments: [{
+        type: 'file',
+        name: 'App.tsx',
+        path: '/repo/src/App.tsx',
+        lineStart: 4,
+        lineEnd: 4,
+      }],
+      displayContent: 'fix this',
+      displayAttachments: [{
+        type: 'file',
+        name: 'App.tsx',
+        path: 'src/App.tsx',
+        lineStart: 4,
+        lineEnd: 4,
+      }],
+    })
+
+    useChatStore.getState().updateQueuedUserMessage(TEST_SESSION_ID, id, 'tighten this')
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.queuedUserMessages?.[0]).toMatchObject({
+      displayContent: 'tighten this',
+      content: 'Referenced workspace context:\n@"src/App.tsx:L4":\n```tsx\nconst value = 1\n```\n\ntighten this',
+    })
+
+    useChatStore.getState().sendQueuedUserMessage(TEST_SESSION_ID, id)
+
+    expect(sendMock).toHaveBeenCalledWith(TEST_SESSION_ID, {
+      type: 'user_message',
+      content: 'Referenced workspace context:\n@"src/App.tsx:L4":\n```tsx\nconst value = 1\n```\n\ntighten this',
+      attachments: [{
+        type: 'file',
+        name: 'App.tsx',
+        path: '/repo/src/App.tsx',
+        lineStart: 4,
+        lineEnd: 4,
+      }],
+    })
+  })
+
   it('can send a visual selection turn without rendering the full model prompt as user text', () => {
     useChatStore.setState({
       sessions: {
@@ -1198,6 +1451,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -1274,6 +1528,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -1441,6 +1696,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [{ name: 'old-command', description: 'Old command' }],
@@ -1814,6 +2070,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -1877,6 +2134,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -1894,6 +2152,35 @@ describe('chatStore history mapping', () => {
     expect(updateSessionPermissionModeMock).toHaveBeenCalledWith('session-1', 'acceptEdits')
   })
 
+  it('mirrors CLI permission-mode broadcasts locally without echoing back to the server', () => {
+    sendMock.mockReset()
+    updateSessionPermissionModeMock.mockReset()
+
+    // CLI 退出 plan 后恢复到 bypassPermissions，回传 permission_mode_changed。
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'permission_mode_changed',
+      mode: 'bypassPermissions',
+    })
+
+    // 本地镜像被校正……
+    expect(updateSessionPermissionModeMock).toHaveBeenCalledWith(TEST_SESSION_ID, 'bypassPermissions')
+    // ……但绝不能再 set_permission_mode 回发给 CLI，否则形成回环。
+    expect(sendMock).not.toHaveBeenCalled()
+  })
+
+  it('ignores permission-mode broadcasts for modes the selector cannot render', () => {
+    updateSessionPermissionModeMock.mockReset()
+
+    // 'auto' 不在桌面端 PermissionMode 内（仅在 CLI 启用对应特性时存在），
+    // 直接忽略，避免选择器拿到无法渲染的值。
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'permission_mode_changed',
+      mode: 'auto' as never,
+    })
+
+    expect(updateSessionPermissionModeMock).not.toHaveBeenCalled()
+  })
+
   it('stores terminal task notifications for agent tool cards', () => {
     useChatStore.setState({
       sessions: {
@@ -1909,6 +2196,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2230,6 +2518,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 12, output_tokens: 34 },
+          streamingResponseChars: 999,
           elapsedSeconds: 5,
           statusVerb: 'Thinking',
           slashCommands: [],
@@ -2254,6 +2543,7 @@ describe('chatStore history mapping', () => {
     expect(session?.streamingText).toBe('')
     expect(session?.chatState).toBe('idle')
     expect(session?.tokenUsage).toEqual({ input_tokens: 0, output_tokens: 0 })
+    expect(session?.streamingResponseChars).toBe(0)
     expect(session?.slashCommands).toEqual([])
     expect(clearTasksMock).toHaveBeenCalledWith(TEST_SESSION_ID)
 
@@ -2303,6 +2593,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2331,6 +2622,19 @@ describe('chatStore history mapping', () => {
         preTokens: 120000,
       },
     ])
+    // The context usage indicator watches this counter to force an
+    // immediate post-compact refresh (#743). The seeded session state above
+    // intentionally lacks compactCount (legacy persisted shape) — the bump
+    // must tolerate that.
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.compactCount).toBe(1)
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'system_notification',
+      subtype: 'compact_boundary',
+      message: 'Context compacted',
+      data: { trigger: 'manual' },
+    })
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.compactCount).toBe(2)
   })
 
   it('attaches compact summary content to the latest compact card', () => {
@@ -2348,6 +2652,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: 'Compacting conversation',
           slashCommands: [],
@@ -2402,6 +2707,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2450,6 +2756,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2530,6 +2837,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2601,6 +2909,72 @@ describe('chatStore history mapping', () => {
     })
 
     expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.apiRetry).toBeNull()
+  })
+
+  it('tracks the streaming fallback notice and supersedes a stale retry banner', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [],
+          chatState: 'thinking',
+          statusVerb: 'Thinking',
+          apiRetry: {
+            attempt: 10,
+            maxRetries: 10,
+            retryDelayMs: 1000,
+            errorStatus: 529,
+            receivedAt: Date.now() - 5_000,
+          },
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'streaming_fallback',
+      cause: 'watchdog',
+    })
+
+    const fallbackSession = useChatStore.getState().sessions[TEST_SESSION_ID]
+    expect(fallbackSession?.streamingFallback).toMatchObject({ cause: 'watchdog' })
+    // 旧的流式重试横幅针对已放弃的请求，必须被降级提示接管。
+    expect(fallbackSession?.apiRetry).toBeNull()
+    expect(fallbackSession?.chatState).toBe('thinking')
+    expect(fallbackSession?.statusVerb).toBe('')
+    expect(updateTabStatusMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, 'running')
+
+    // 非流式响应的首个内容块到达即清除降级提示。
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_start',
+      blockType: 'text',
+    })
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.streamingFallback).toBeNull()
+  })
+
+  it('keeps the fallback notice when idle and clears it on turn completion', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [],
+          chatState: 'idle',
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'streaming_fallback',
+      cause: '404_stream_creation',
+    })
+
+    // idle 会话收到降级信号说明回合仍在跑，状态条要回到 thinking。
+    const session = useChatStore.getState().sessions[TEST_SESSION_ID]
+    expect(session?.chatState).toBe('thinking')
+    expect(session?.streamingFallback).toMatchObject({ cause: '404_stream_creation' })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'message_complete',
+      usage: { input_tokens: 1, output_tokens: 0 },
+    })
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.streamingFallback).toBeNull()
   })
 
   it('renders memory saved notifications as chat memory events', () => {
@@ -2774,6 +3148,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2819,6 +3194,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2926,6 +3302,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2996,6 +3373,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3129,6 +3507,100 @@ describe('chatStore history mapping', () => {
 
     vi.runOnlyPendingTimers()
     vi.useRealTimers()
+  })
+
+  it('does not duplicate the current prompt when CLI replays it after thinking starts', () => {
+    const prompt = '# 角色与目标\n构建一个协同编辑器'
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [
+            {
+              id: 'live-user',
+              type: 'user_text',
+              content: prompt,
+              timestamp: 1,
+            },
+          ],
+          chatState: 'thinking',
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'thinking',
+      text: 'I need to plan the implementation.',
+    })
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'user_message_replay',
+      content: prompt,
+    })
+
+    const userMessages = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+      .filter((message) => message.type === 'user_text')
+    expect(userMessages).toHaveLength(1)
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages).toMatchObject([
+      { type: 'user_text', content: prompt },
+      { type: 'thinking', content: 'I need to plan the implementation.' },
+    ])
+  })
+
+  it('does not leak an image-bearing prompt when the replay appends [Image source] metadata (Windows path)', () => {
+    // The optimistic message (e.g. a visual-selection annotation card) stores the
+    // prompt body in modelContent with a hidden display. The CLI replay carries
+    // the server-appended `[Image source: …]` line on the same text. Dedupe must
+    // still match — otherwise the raw prompt + absolute upload path leak in as a
+    // second grey bubble (the reported Windows regression).
+    const prompt = '请根据截图中编号 1 的蓝色标注修改本地前端。\n目标元素：<button>'
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [
+            {
+              id: 'live-user',
+              type: 'user_text',
+              content: '',
+              modelContent: prompt,
+              timestamp: 1,
+            },
+          ],
+          chatState: 'thinking',
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'user_message_replay',
+      content: `${prompt}\n[Image source: C:\\Users\\Relakkes\\.claude\\uploads\\sid\\82017405-_button_.png]`,
+    })
+
+    const userMessages = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+      .filter((message) => message.type === 'user_text')
+    expect(userMessages).toHaveLength(1)
+    expect(userMessages?.[0]).toMatchObject({ content: '', modelContent: prompt })
+  })
+
+  it('dedupes an image-bearing prompt when the replay appends detailed (macOS) image metadata', () => {
+    const prompt = 'describe this screenshot for me'
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [
+            { id: 'live-user', type: 'user_text', content: prompt, timestamp: 1 },
+          ],
+          chatState: 'thinking',
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'user_message_replay',
+      content: `${prompt}\n[Image: source: /Users/me/.claude/uploads/sid/a.png, original 1024x768, displayed at 512x384. Multiply coordinates by 2 to map to original image.]`,
+    })
+
+    const userMessages = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+      .filter((message) => message.type === 'user_text')
+    expect(userMessages).toHaveLength(1)
   })
 
   it('flushes pending text before appending an error message', () => {
@@ -3286,6 +3758,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3388,6 +3861,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3440,6 +3914,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3472,6 +3947,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3513,6 +3989,7 @@ describe('chatStore history mapping', () => {
             },
           },
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3577,6 +4054,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3618,6 +4096,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3653,5 +4132,58 @@ describe('chatStore history mapping', () => {
       content: '开始优化UI',
       attachments: undefined,
     })
+  })
+
+  // issue #757: the streaming indicator estimates this turn's output tokens
+  // from streamed characters (÷4, mirroring the CLI spinner) instead of
+  // showing the previous turn's stale usage.
+  it('accumulates streamed text, tool input, and thinking chars for the token estimate', () => {
+    vi.useFakeTimers()
+    useChatStore.setState({ sessions: { [TEST_SESSION_ID]: makeSession() } })
+
+    const charsOf = () =>
+      useChatStore.getState().sessions[TEST_SESSION_ID]?.streamingResponseChars
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_delta',
+      text: 'a'.repeat(40),
+    })
+    vi.advanceTimersByTime(60)
+    expect(charsOf()).toBe(40)
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_delta',
+      toolInput: '{"a":1}',
+    })
+    vi.advanceTimersByTime(60)
+    expect(charsOf()).toBe(47)
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'thinking',
+      text: 'pondering',
+    })
+    expect(charsOf()).toBe(56)
+
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+  })
+
+  it('resets the streaming token estimate when the user sends the next message', () => {
+    vi.useFakeTimers()
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'idle',
+          streamingResponseChars: 4321,
+        }),
+      },
+    })
+
+    useChatStore.getState().sendMessage(TEST_SESSION_ID, '继续')
+
+    const session = useChatStore.getState().sessions[TEST_SESSION_ID]
+    expect(session?.streamingResponseChars).toBe(0)
+    if (session?.elapsedTimer) clearInterval(session.elapsedTimer)
+    vi.useRealTimers()
   })
 })

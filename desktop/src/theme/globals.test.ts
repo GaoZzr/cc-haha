@@ -89,6 +89,17 @@ describe('desktop theme tokens', () => {
     expect(css).toContain('box-shadow: var(--shadow-activity-cell-hover);')
   })
 
+  it('uses container queries for the compact activity summary strip', () => {
+    const activitySummaryCss = getCssBetween('.activity-summary-panel {', '.activity-heat-cell {')
+
+    expect(activitySummaryCss).toContain('container-type: inline-size;')
+    expect(activitySummaryCss).toContain('@container (min-width: 360px)')
+    expect(activitySummaryCss).toContain('@container (min-width: 560px)')
+    expect(activitySummaryCss).toContain('grid-template-columns: repeat(5, minmax(0, 1fr));')
+    expect(activitySummaryCss).toContain('grid-column: auto;')
+    expect(activitySummaryCss).not.toContain('grid-column: span 2;')
+  })
+
   it('avoids color-mix in the startup-critical UI zoom shell chrome for Safari 15 WebView support', () => {
     const zoomShellCss = getCssBetween('.settings-zoom-kbd {', '/* ─── Tailwind Theme Override')
 

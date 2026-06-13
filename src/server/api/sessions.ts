@@ -7,6 +7,8 @@
  *   GET    /api/sessions            — 列出会话
  *   GET    /api/sessions/:id        — 获取会话详情
  *   GET    /api/sessions/:id/messages — 获取会话消息
+ *   GET    /api/sessions/:id/trace — 获取会话级模型调用 trace（body preview 裁剪后的列表视图）
+ *   GET    /api/sessions/:id/trace/calls/:callId — 获取单次调用的完整 trace 记录
  *   GET    /api/sessions/:id/turn-checkpoints — 获取按轮次保留的 checkpoint 预览
  *   GET    /api/sessions/:id/turn-checkpoints/diff — 获取绑定到指定 checkpoint 的 diff
  *   POST   /api/sessions            — 创建新会话
@@ -38,7 +40,8 @@ import {
   createSessionBranch,
   SessionBranchingError,
 } from '../../utils/sessionBranching.js'
-import { registerFilesystemAccessRoot } from '../services/filesystemAccessRoots.js'
+import { registerChangedFileAccessRoot, registerFilesystemAccessRoot } from '../services/filesystemAccessRoots.js'
+import { traceCaptureService, trimTraceCallPreviews } from '../services/traceCaptureService.js'
 
 const workspaceService = new WorkspaceService(
   async (sessionId) => (
@@ -108,6 +111,18 @@ export async function handleSessionsApi(
         )
       }
       return await getSessionMessages(sessionId)
+    }
+
+    if (subResource === 'trace') {
+      if (req.method !== 'GET') {
+        return Response.json(
+          { error: 'METHOD_NOT_ALLOWED', message: `Method ${req.method} not allowed` },
+          { status: 405 }
+        )
+      }
+      return segments[4] === 'calls'
+        ? await getSessionTraceCall(sessionId, segments[5])
+        : await getSessionTrace(sessionId)
     }
 
     if (subResource === 'git-info') {
@@ -248,6 +263,37 @@ async function getSessionMessages(sessionId: string): Promise<Response> {
     sessionService.getSessionTaskNotifications(sessionId),
   ])
   return Response.json({ messages, taskNotifications })
+}
+
+async function getSessionTrace(sessionId: string): Promise<Response> {
+  const [trace, session] = await Promise.all([
+    traceCaptureService.getSessionTrace(sessionId),
+    sessionService.getSession(sessionId).catch(() => null),
+  ])
+  return Response.json({
+    ...trace,
+    calls: trace.calls.map((call) => trimTraceCallPreviews(call)),
+    session: session
+      ? {
+          id: session.id,
+          title: session.title,
+          projectPath: session.projectPath,
+          workDir: session.workDir,
+        }
+      : null,
+  })
+}
+
+async function getSessionTraceCall(sessionId: string, callId: string | undefined): Promise<Response> {
+  if (!callId || callId.trim().length === 0) {
+    throw ApiError.badRequest('callId is required')
+  }
+
+  const call = await traceCaptureService.getSessionTraceCall(sessionId, callId)
+  if (!call) {
+    throw ApiError.notFound(`Trace call not found: ${callId}`)
+  }
+  return Response.json({ call })
 }
 
 async function handleSessionWorkspaceRoute(
@@ -805,6 +851,14 @@ async function branchSession(req: Request, sessionId: string): Promise<Response>
 
 async function getTurnCheckpoints(sessionId: string): Promise<Response> {
   const checkpoints = await listSessionTurnCheckpoints(sessionId)
+  // Make this turn's real changed files previewable even when they live outside
+  // the session workdir (e.g. the user told the model to write to an absolute
+  // path on another drive). Writing them was authorized, so previewing is too.
+  for (const checkpoint of checkpoints) {
+    for (const filePath of checkpoint.code.filesChanged) {
+      registerChangedFileAccessRoot(filePath, checkpoint.workDir)
+    }
+  }
   return Response.json({ checkpoints })
 }
 

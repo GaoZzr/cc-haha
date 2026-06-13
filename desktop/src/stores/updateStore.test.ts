@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { browserHost } from '../lib/desktopHost/browserHost'
 
 const check = vi.fn()
 const relaunch = vi.fn()
@@ -16,16 +17,34 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke,
 }))
 
+function installElectronUpdateHost() {
+  window.desktopHost = {
+    ...browserHost,
+    kind: 'electron',
+    isDesktop: true,
+    capabilities: {
+      ...browserHost.capabilities,
+      updates: true,
+    },
+    updates: {
+      ...browserHost.updates,
+      check,
+      prepareInstall: () => invoke('prepare_for_update_install'),
+      cancelInstall: () => invoke('cancel_update_install'),
+      relaunch,
+    },
+  }
+}
+
 describe('updateStore', () => {
   beforeEach(() => {
     check.mockReset()
     relaunch.mockReset()
     invoke.mockReset()
     window.localStorage.clear()
-    Object.defineProperty(window, '__TAURI_INTERNALS__', {
-      configurable: true,
-      value: {},
-    })
+    installElectronUpdateHost()
+    Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
+    Reflect.deleteProperty(window, '__TAURI__')
   })
 
   it('stores available update metadata after a successful check', async () => {
@@ -53,6 +72,93 @@ describe('updateStore', () => {
     expect(download).toHaveBeenCalledTimes(1)
     expect(useUpdateStore.getState().status).toBe('downloaded')
     expect(useUpdateStore.getState().shouldPrompt).toBe(true)
+  })
+
+  it('treats same-version update metadata as already up to date', async () => {
+    const download = vi.fn().mockResolvedValue(undefined)
+    const close = vi.fn().mockResolvedValue(undefined)
+    window.desktopHost = {
+      ...browserHost,
+      kind: 'electron',
+      isDesktop: true,
+      capabilities: {
+        ...browserHost.capabilities,
+        updates: true,
+      },
+      app: {
+        getVersion: vi.fn().mockResolvedValue('0.4.1'),
+      },
+      updates: {
+        ...browserHost.updates,
+        check: vi.fn().mockResolvedValue({
+          version: '0.4.1',
+          body: 'Already installed',
+          download,
+          close,
+        }),
+      },
+    }
+
+    vi.resetModules()
+    const { useUpdateStore } = await import('./updateStore')
+
+    await expect(useUpdateStore.getState().checkForUpdates()).resolves.toBeNull()
+
+    expect(download).not.toHaveBeenCalled()
+    expect(close).toHaveBeenCalledTimes(1)
+    expect(useUpdateStore.getState().status).toBe('up-to-date')
+    expect(useUpdateStore.getState().availableVersion).toBeNull()
+    expect(useUpdateStore.getState().shouldPrompt).toBe(false)
+  })
+
+  it('checks, installs, and relaunches through an injected desktop host', async () => {
+    Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
+    const download = vi.fn(async (onEvent?: (event: unknown) => void) => {
+      onEvent?.({ event: 'Started', data: { contentLength: 100 } })
+      onEvent?.({ event: 'Progress', data: { chunkLength: 100 } })
+      onEvent?.({ event: 'Finished' })
+    })
+    const install = vi.fn().mockResolvedValue(undefined)
+    const checkUpdate = vi.fn().mockResolvedValue({
+      version: '0.4.0',
+      body: 'Electron host update',
+      download,
+      install,
+      close: vi.fn().mockResolvedValue(undefined),
+    })
+    const prepareInstall = vi.fn().mockResolvedValue(undefined)
+    const relaunchHost = vi.fn().mockResolvedValue(undefined)
+
+    window.desktopHost = {
+      ...browserHost,
+      kind: 'electron',
+      isDesktop: true,
+      capabilities: {
+        ...browserHost.capabilities,
+        updates: true,
+      },
+      updates: {
+        ...browserHost.updates,
+        check: checkUpdate,
+        prepareInstall,
+        relaunch: relaunchHost,
+      },
+    }
+
+    vi.resetModules()
+    const { useUpdateStore } = await import('./updateStore')
+
+    const result = await useUpdateStore.getState().checkForUpdates()
+    await useUpdateStore.getState().installUpdate()
+
+    expect(result?.version).toBe('0.4.0')
+    expect(checkUpdate).toHaveBeenCalledWith(undefined)
+    expect(download).toHaveBeenCalledTimes(1)
+    expect(prepareInstall).toHaveBeenCalledTimes(1)
+    expect(install).toHaveBeenCalledTimes(1)
+    expect(relaunchHost).toHaveBeenCalledTimes(1)
+    expect(invoke).not.toHaveBeenCalled()
+    expect(relaunch).not.toHaveBeenCalled()
   })
 
   it('does not show the global prompt while a background download is still running', async () => {

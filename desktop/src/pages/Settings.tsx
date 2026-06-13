@@ -1,15 +1,32 @@
 import { useState, useEffect, useMemo, useRef, type CSSProperties, type ReactNode } from 'react'
 import QRCode from 'qrcode'
-import { Copy, Eye, EyeOff, PowerOff, QrCode, RotateCw } from 'lucide-react'
+import {
+  closestCenter,
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core'
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
+import { Copy, Eye, EyeOff, GripVertical, PowerOff, QrCode, RotateCw } from 'lucide-react'
 import { useSettingsStore, UI_ZOOM_DEFAULT, UI_ZOOM_MIN, UI_ZOOM_MAX, UI_ZOOM_STEP } from '../stores/settingsStore'
 import { useProviderStore } from '../stores/providerStore'
-import { useTranslation } from '../i18n'
+import { useTranslation, type TranslationKey } from '../i18n'
 import { Modal } from '../components/shared/Modal'
 import { ConfirmDialog } from '../components/shared/ConfirmDialog'
 import { Input } from '../components/shared/Input'
 import { Button } from '../components/shared/Button'
 import { Dropdown } from '../components/shared/Dropdown'
-import type { ThemeMode, UpdateProxyMode, NetworkProxyMode, WebSearchMode, AppMode, ChatSendBehavior } from '../types/settings'
+import type { ThemeMode, UpdateProxyMode, NetworkProxyMode, WebSearchMode, AppMode, ChatSendBehavior, OutputStyleSource } from '../types/settings'
 import type { Locale } from '../i18n'
 import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, ApiFormat, ProviderAuthStrategy } from '../types/provider'
 import type { ProviderPreset } from '../types/providerPreset'
@@ -28,18 +45,27 @@ import { ComputerUseSettings } from './ComputerUseSettings'
 import { McpSettings } from './McpSettings'
 import { TerminalSettings } from './TerminalSettings'
 import { DiagnosticsSettings } from './DiagnosticsSettings'
+import { TraceList } from './TraceList'
 import { ActivitySettings } from './ActivitySettings'
 import { MemorySettings } from './MemorySettings'
 import { useUIStore, type SettingsTab } from '../stores/uiStore'
 import { ClaudeOfficialLogin } from '../components/settings/ClaudeOfficialLogin'
 import { ChatGPTOfficialLogin } from '../components/settings/ChatGPTOfficialLogin'
-import { OPENAI_OFFICIAL_PROVIDER_ID } from '../constants/openaiOfficialProvider'
+import {
+  BUILT_IN_PROVIDER_IDS,
+  CLAUDE_OFFICIAL_PROVIDER_ID,
+  OPENAI_OFFICIAL_PROVIDER_ID,
+} from '../constants/openaiOfficialProvider'
 import { useUpdateStore } from '../stores/updateStore'
+import { getBaseUrl } from '../api/client'
 import { formatBytes } from '../lib/formatBytes'
-import { isTauriRuntime } from '../lib/desktopRuntime'
+import { isDesktopRuntime } from '../lib/desktopRuntime'
+import { getDesktopHost } from '../lib/desktopHost'
+import { publicAssetPath } from '../lib/publicAsset'
 import {
   getDesktopNotificationPermission,
   notifyDesktop,
+  getDesktopNotificationPlatform,
   openDesktopNotificationSettings,
   requestDesktopNotificationPermission,
   type DesktopNotificationPermission,
@@ -52,9 +78,10 @@ import {
 } from '../lib/providerSettingsJson'
 import { copyTextToClipboard } from '../components/chat/clipboard'
 
-const NETWORK_TIMEOUT_MIN_SECONDS = 5
-const NETWORK_TIMEOUT_MAX_SECONDS = 600
+const NETWORK_TIMEOUT_MIN_SECONDS = 30
+const NETWORK_TIMEOUT_MAX_SECONDS = 1800
 const NETWORK_TIMEOUT_STEP_SECONDS = 30
+const SETTINGS_CHECKBOX_INPUT_CLASS = 'settings-checkbox-input peer'
 
 function buildH5LaunchUrl(baseUrl: string | null, token: string | null): string | null {
   if (!baseUrl) return null
@@ -117,6 +144,25 @@ function extractH5AccessPort(baseUrl: string | null): string | null {
   }
 }
 
+// Mirrors the server-side fixedPort range (h5AccessService MIN/MAX_FIXED_PORT).
+function parseH5FixedPortDraft(draft: string): number | null | 'invalid' {
+  const trimmed = draft.trim()
+  if (!trimmed) return null
+  if (!/^\d{1,5}$/.test(trimmed)) return 'invalid'
+  const port = Number(trimmed)
+  return port >= 1024 && port <= 65535 ? port : 'invalid'
+}
+
+// Mirrors the server-side disconnect grace range (h5AccessService
+// MIN/MAX_DISCONNECT_GRACE_SECONDS). Empty = use the built-in 30s default.
+function parseH5GraceDraft(draft: string): number | null | 'invalid' {
+  const trimmed = draft.trim()
+  if (!trimmed) return null
+  if (!/^\d{1,5}$/.test(trimmed)) return 'invalid'
+  const seconds = Number(trimmed)
+  return seconds >= 5 && seconds <= 86400 ? seconds : 'invalid'
+}
+
 function buildH5PublicBaseUrlFromHostDraft(draft: string, currentBaseUrl: string | null): string | null {
   const trimmed = draft.trim()
   if (!trimmed) return null
@@ -163,6 +209,7 @@ export function Settings() {
             <TabButton icon="extension" label={t('settings.tab.plugins')} active={activeTab === 'plugins'} onClick={() => setActiveTab('plugins')} />
             <TabButton icon="mouse" label={t('settings.tab.computerUse')} active={activeTab === 'computerUse'} onClick={() => setActiveTab('computerUse')} />
             <TabButton icon="monitoring" label={t('settings.tab.activity')} active={activeTab === 'activity'} onClick={() => setActiveTab('activity')} />
+            <TabButton icon="account_tree" label={t('settings.tab.trace')} active={activeTab === 'trace'} onClick={() => setActiveTab('trace')} />
             <TabButton icon="monitor_heart" label={t('settings.tab.diagnostics')} active={activeTab === 'diagnostics'} onClick={() => setActiveTab('diagnostics')} />
           </div>
           <div className="border-t border-[var(--color-border)]/40 pt-1">
@@ -170,8 +217,8 @@ export function Settings() {
           </div>
         </div>
 
-        {/* Tab content */}
-        <div className="flex-1 overflow-y-auto px-8 py-6">
+        {/* Tab content; trace embeds a full-bleed page that manages its own scroll */}
+        <div className={activeTab === 'trace' ? 'flex-1 flex min-h-0 flex-col overflow-hidden' : 'flex-1 overflow-y-auto px-8 py-6'}>
           {activeTab === 'providers' && <ProviderSettings />}
           {activeTab === 'activity' && <ActivitySettings />}
           {activeTab === 'general' && <GeneralSettings />}
@@ -184,6 +231,7 @@ export function Settings() {
           {activeTab === 'memory' && <MemorySettings />}
           {activeTab === 'plugins' && <PluginSettings />}
           {activeTab === 'computerUse' && <ComputerUseSettings />}
+          {activeTab === 'trace' && <TraceList />}
           {activeTab === 'diagnostics' && <DiagnosticsSettings />}
           {activeTab === 'about' && <AboutSettings />}
         </div>
@@ -210,9 +258,78 @@ function TabButton({ icon, label, active, onClick }: { icon: string; label: stri
 
 // ─── Provider Settings ──────────────────────────────────────
 
+type ProviderListItem =
+  | { id: typeof CLAUDE_OFFICIAL_PROVIDER_ID; kind: 'claude-official' }
+  | { id: typeof OPENAI_OFFICIAL_PROVIDER_ID; kind: 'openai-official' }
+  | { id: string; kind: 'saved'; provider: SavedProvider }
+
+function defaultProviderOrder(providers: SavedProvider[]): string[] {
+  return [
+    ...providers.map((provider) => provider.id),
+    ...BUILT_IN_PROVIDER_IDS,
+  ]
+}
+
+function normalizeProviderOrder(providerOrder: string[] | undefined, providers: SavedProvider[]): string[] {
+  const knownIds = new Set<string>(defaultProviderOrder(providers))
+  const seen = new Set<string>()
+  const order: string[] = []
+
+  const source = providerOrder && providerOrder.length > 0
+    ? providerOrder
+    : defaultProviderOrder(providers)
+
+  for (const id of source) {
+    if (!knownIds.has(id) || seen.has(id)) continue
+    seen.add(id)
+    order.push(id)
+  }
+
+  for (const id of defaultProviderOrder(providers)) {
+    if (seen.has(id)) continue
+    seen.add(id)
+    order.push(id)
+  }
+
+  return order
+}
+
+function buildProviderListItems(
+  providers: SavedProvider[],
+  providerOrder: string[] | undefined,
+): ProviderListItem[] {
+  const savedItems = new Map(
+    providers.map((provider) => [
+      provider.id,
+      { id: provider.id, kind: 'saved', provider } satisfies ProviderListItem,
+    ]),
+  )
+  const items = new Map<string, ProviderListItem>([
+    [CLAUDE_OFFICIAL_PROVIDER_ID, { id: CLAUDE_OFFICIAL_PROVIDER_ID, kind: 'claude-official' }],
+    [OPENAI_OFFICIAL_PROVIDER_ID, { id: OPENAI_OFFICIAL_PROVIDER_ID, kind: 'openai-official' }],
+    ...savedItems,
+  ])
+
+  return normalizeProviderOrder(providerOrder, providers)
+    .map((id) => items.get(id))
+    .filter((item): item is ProviderListItem => item !== undefined)
+}
+
+function providerItemTestId(item: ProviderListItem): string {
+  switch (item.kind) {
+    case 'claude-official':
+      return 'claude-official-provider'
+    case 'openai-official':
+      return 'openai-official-provider'
+    case 'saved':
+      return `provider-${item.provider.id}`
+  }
+}
+
 function ProviderSettings() {
   const {
     providers,
+    providerOrder,
     activeId,
     hasLoadedProviders,
     presets,
@@ -221,6 +338,7 @@ function ProviderSettings() {
     fetchProviders,
     fetchPresets,
     deleteProvider,
+    reorderProviders,
     activateProvider,
     activateOfficial,
     testProvider,
@@ -232,6 +350,14 @@ function ProviderSettings() {
   const [pendingDeleteProvider, setPendingDeleteProvider] = useState<SavedProvider | null>(null)
   const [isDeletingProvider, setIsDeletingProvider] = useState(false)
   const [testResults, setTestResults] = useState<Record<string, { loading: boolean; result?: ProviderTestResult }>>({})
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 6 },
+    }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  )
 
   useEffect(() => {
     void fetchProviders()
@@ -281,6 +407,23 @@ function ProviderSettings() {
     await fetchSettings()
   }
 
+  const providerItems = useMemo(
+    () => buildProviderListItems(providers, providerOrder),
+    [providerOrder, providers],
+  )
+
+  const handleProviderDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event
+    if (!over || active.id === over.id) return
+
+    const ids = providerItems.map((item) => item.id)
+    const oldIndex = ids.indexOf(String(active.id))
+    const newIndex = ids.indexOf(String(over.id))
+    if (oldIndex === -1 || newIndex === -1) return
+
+    void reorderProviders(arrayMove(ids, oldIndex, newIndex))
+  }
+
   const isClaudeOfficialActive = hasLoadedProviders && activeId === null
   const isOpenAIOfficialActive = hasLoadedProviders && activeId === OPENAI_OFFICIAL_PROVIDER_ID
 
@@ -297,110 +440,92 @@ function ProviderSettings() {
         </Button>
       </div>
 
-      {/* Official provider — always visible at top */}
-      <div
-        data-testid="claude-official-provider"
-        className={`relative flex flex-col rounded-xl border transition-all mb-2 ${
-          isClaudeOfficialActive
-            ? 'border-[var(--color-brand)] bg-[var(--color-surface-container)] shadow-[var(--shadow-focus-ring)]'
-            : 'border-[var(--color-border)] hover:border-[var(--color-border-focus)] cursor-pointer'
-        }`}
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleProviderDragEnd}
       >
-        <div
-          className="flex items-center gap-4 px-4 py-3.5"
-          onClick={() => !isClaudeOfficialActive && handleActivateOfficial()}
+        <SortableContext
+          items={providerItems.map((item) => item.id)}
+          strategy={verticalListSortingStrategy}
         >
-          <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${isClaudeOfficialActive ? 'bg-[var(--color-success)]' : 'bg-[var(--color-text-tertiary)]'}`} />
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="text-sm font-semibold text-[var(--color-text-primary)]">{t('settings.providers.officialName')}</span>
-              {isClaudeOfficialActive && (
-                <span className="px-1.5 py-0.5 text-[10px] font-bold rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/14 text-[var(--color-brand)] leading-none">{t('settings.providers.default')}</span>
-              )}
-            </div>
-            <div className="text-xs text-[var(--color-text-tertiary)] mt-0.5">{t('settings.providers.officialDesc')}</div>
-          </div>
-        </div>
+          <div className="flex flex-col gap-2">
+            {providerItems.map((item) => {
+              if (item.kind === 'claude-official') {
+                return (
+                  <SortableProviderCard
+                    key={item.id}
+                    item={item}
+                    isActive={isClaudeOfficialActive}
+                    dragLabel={t('settings.providers.dragToReorder')}
+                    onActivate={!isClaudeOfficialActive ? handleActivateOfficial : undefined}
+                    title={t('settings.providers.officialName')}
+                    subtitle={t('settings.providers.officialDesc')}
+                    badges={isClaudeOfficialActive ? (
+                      <span className="rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/12 px-1.5 py-0.5 text-[10px] font-bold leading-none text-[var(--color-brand)]">{t('settings.providers.default')}</span>
+                    ) : null}
+                    details={isClaudeOfficialActive ? (
+                      <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
+                        <ClaudeOfficialLogin />
+                      </div>
+                    ) : null}
+                  />
+                )
+              }
 
-        {isClaudeOfficialActive && (
-          <div className="px-4 pb-4 pt-3 border-t border-[var(--color-border-separator)]">
-            <ClaudeOfficialLogin />
-          </div>
-        )}
-      </div>
+              if (item.kind === 'openai-official') {
+                return (
+                  <SortableProviderCard
+                    key={item.id}
+                    item={item}
+                    isActive={isOpenAIOfficialActive}
+                    dragLabel={t('settings.providers.dragToReorder')}
+                    onActivate={!isOpenAIOfficialActive ? () => handleActivate(OPENAI_OFFICIAL_PROVIDER_ID) : undefined}
+                    title={t('settings.providers.openaiOfficialName')}
+                    subtitle={t('settings.providers.openaiOfficialDesc')}
+                    badges={isOpenAIOfficialActive ? (
+                      <span className="rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/12 px-1.5 py-0.5 text-[10px] font-bold leading-none text-[var(--color-brand)]">{t('settings.providers.default')}</span>
+                    ) : null}
+                    details={isOpenAIOfficialActive ? (
+                      <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
+                        <ChatGPTOfficialLogin />
+                      </div>
+                    ) : null}
+                  />
+                )
+              }
 
-      <div
-        data-testid="openai-official-provider"
-        className={`relative flex flex-col rounded-xl border transition-all mb-2 ${
-          isOpenAIOfficialActive
-            ? 'border-[var(--color-brand)] bg-[var(--color-surface-container)] shadow-[var(--shadow-focus-ring)]'
-            : 'border-[var(--color-border)] hover:border-[var(--color-border-focus)] cursor-pointer'
-        }`}
-      >
-        <div
-          className="flex items-center gap-4 px-4 py-3.5"
-          onClick={() => !isOpenAIOfficialActive && handleActivate(OPENAI_OFFICIAL_PROVIDER_ID)}
-        >
-          <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${isOpenAIOfficialActive ? 'bg-[var(--color-success)]' : 'bg-[var(--color-text-tertiary)]'}`} />
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="text-sm font-semibold text-[var(--color-text-primary)]">{t('settings.providers.openaiOfficialName')}</span>
-              {isOpenAIOfficialActive && (
-                <span className="px-1.5 py-0.5 text-[10px] font-bold rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/14 text-[var(--color-brand)] leading-none">{t('settings.providers.default')}</span>
-              )}
-            </div>
-            <div className="text-xs text-[var(--color-text-tertiary)] mt-0.5">{t('settings.providers.openaiOfficialDesc')}</div>
-          </div>
-        </div>
+              const provider = item.provider
+              const isActive = activeId === provider.id
+              const test = testResults[provider.id]
+              const preset = presetMap.get(provider.presetId)
 
-        {isOpenAIOfficialActive && (
-          <div className="px-4 pb-4 pt-3 border-t border-[var(--color-border-separator)]">
-            <ChatGPTOfficialLogin />
-          </div>
-        )}
-      </div>
-
-      {/* Saved providers */}
-      {isLoading && providers.length === 0 ? (
-        <div className="flex justify-center py-8">
-          <div className="animate-spin w-5 h-5 border-2 border-[var(--color-brand)] border-t-transparent rounded-full" />
-        </div>
-      ) : (
-        <div className="flex flex-col gap-2">
-          {providers.map((provider) => {
-            const isActive = activeId === provider.id
-            const test = testResults[provider.id]
-            const preset = presetMap.get(provider.presetId)
-            return (
-              <div
-                key={provider.id}
-                className={`relative flex items-center gap-4 px-4 py-3.5 rounded-xl border transition-all group ${
-                  isActive
-                    ? 'border-[var(--color-brand)] bg-[var(--color-surface-container)] shadow-[var(--shadow-focus-ring)]'
-                    : 'border-[var(--color-border)] hover:border-[var(--color-border-focus)]'
-                }`}
-              >
-                <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${isActive ? 'bg-[var(--color-success)]' : 'bg-[var(--color-text-tertiary)]'}`} />
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-semibold text-[var(--color-text-primary)] truncate">{provider.name}</span>
-                    {preset && preset.id !== 'custom' && (
-                      <span className="px-1.5 py-0.5 text-[10px] font-medium rounded bg-[var(--color-surface-container-high)] text-[var(--color-text-tertiary)] leading-none">{preset.name}</span>
-                    )}
-                    {provider.apiFormat && provider.apiFormat !== 'anthropic' && (
-                      <span className="px-1.5 py-0.5 text-[10px] font-medium rounded bg-[var(--color-surface-container-high)] text-[var(--color-warning)] leading-none">
-                        {provider.apiFormat === 'openai_chat' ? 'OpenAI Chat' : 'OpenAI Responses'}
-                      </span>
-                    )}
-                    {isActive && (
-                      <span className="px-1.5 py-0.5 text-[10px] font-bold rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/14 text-[var(--color-brand)] leading-none">{t('settings.providers.default')}</span>
-                    )}
-                  </div>
-                  <div className="text-xs text-[var(--color-text-tertiary)] truncate mt-0.5">
-                    {provider.baseUrl} &middot; {provider.models.main}
-                  </div>
-                  {test && !test.loading && test.result && (
-                    <div className="text-xs mt-1 flex flex-col gap-0.5">
+              return (
+                <SortableProviderCard
+                  key={item.id}
+                  item={item}
+                  isActive={isActive}
+                  dragLabel={t('settings.providers.dragToReorder')}
+                  onActivate={!isActive ? () => handleActivate(provider.id) : undefined}
+                  title={provider.name}
+                  subtitle={`${provider.baseUrl} · ${provider.models.main}`}
+                  badges={(
+                    <>
+                      {preset && preset.id !== 'custom' && (
+                        <span className="rounded bg-[var(--color-surface-container-high)] px-1.5 py-0.5 text-[10px] font-medium leading-none text-[var(--color-text-tertiary)]">{preset.name}</span>
+                      )}
+                      {provider.apiFormat && provider.apiFormat !== 'anthropic' && (
+                        <span className="rounded bg-[var(--color-surface-container-high)] px-1.5 py-0.5 text-[10px] font-medium leading-none text-[var(--color-warning)]">
+                          {provider.apiFormat === 'openai_chat' ? 'OpenAI Chat' : 'OpenAI Responses'}
+                        </span>
+                      )}
+                      {isActive && (
+                        <span className="rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/12 px-1.5 py-0.5 text-[10px] font-bold leading-none text-[var(--color-brand)]">{t('settings.providers.default')}</span>
+                      )}
+                    </>
+                  )}
+                  result={test && !test.loading && test.result ? (
+                    <div className="mt-1 flex flex-col gap-0.5 text-xs">
                       <span className={test.result.connectivity.success ? 'text-[var(--color-success)]' : 'text-[var(--color-error)]'}>
                         {test.result.connectivity.success
                           ? t('settings.providers.connectivityOk', { latency: String(test.result.connectivity.latencyMs) })
@@ -414,23 +539,31 @@ function ProviderSettings() {
                         </span>
                       )}
                     </div>
+                  ) : null}
+                  actions={(
+                    <>
+                      {!isActive && (
+                        <Button variant="ghost" size="sm" onClick={() => handleActivate(provider.id)}>{t('settings.providers.setDefault')}</Button>
+                      )}
+                      <Button variant="ghost" size="sm" onClick={() => handleTest(provider)} loading={test?.loading}>{t('settings.providers.test')}</Button>
+                      <Button variant="ghost" size="sm" onClick={() => setEditingProvider(provider)}>{t('settings.providers.edit')}</Button>
+                      {!isActive && (
+                        <Button variant="ghost" size="sm" onClick={() => handleDelete(provider)} className="text-[var(--color-error)] hover:text-[var(--color-error)]">{t('common.delete')}</Button>
+                      )}
+                    </>
                   )}
-                </div>
-                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
-                  {!isActive && (
-                    <Button variant="ghost" size="sm" onClick={() => handleActivate(provider.id)}>{t('settings.providers.setDefault')}</Button>
-                  )}
-                  <Button variant="ghost" size="sm" onClick={() => handleTest(provider)} loading={test?.loading}>{t('settings.providers.test')}</Button>
-                  <Button variant="ghost" size="sm" onClick={() => setEditingProvider(provider)}>{t('settings.providers.edit')}</Button>
-                  {!isActive && (
-                    <Button variant="ghost" size="sm" onClick={() => handleDelete(provider)} className="text-[var(--color-error)] hover:text-[var(--color-error)]">{t('common.delete')}</Button>
-                  )}
-                </div>
-              </div>
-            )
-          })}
+                />
+              )
+            })}
+          </div>
+        </SortableContext>
+      </DndContext>
+
+      {isLoading && providers.length === 0 ? (
+        <div className="flex justify-center py-8">
+          <div className="animate-spin w-5 h-5 border-2 border-[var(--color-brand)] border-t-transparent rounded-full" />
         </div>
-      )}
+      ) : null}
 
       {/* Create Modal — conditionally rendered so state resets on close */}
       {showCreateModal && (
@@ -456,6 +589,97 @@ function ProviderSettings() {
         confirmVariant="danger"
         loading={isDeletingProvider}
       />
+    </div>
+  )
+}
+
+type SortableProviderCardProps = {
+  item: ProviderListItem
+  isActive: boolean
+  dragLabel: string
+  title: ReactNode
+  subtitle: ReactNode
+  badges?: ReactNode
+  result?: ReactNode
+  actions?: ReactNode
+  details?: ReactNode
+  onActivate?: () => void
+}
+
+function SortableProviderCard({
+  item,
+  isActive,
+  dragLabel,
+  title,
+  subtitle,
+  badges,
+  result,
+  actions,
+  details,
+  onActivate,
+}: SortableProviderCardProps) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: item.id })
+  const style: CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    zIndex: isDragging ? 20 : undefined,
+  }
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      data-testid={providerItemTestId(item)}
+      className={`group relative flex flex-col rounded-[8px] border transition-colors ${
+        isActive
+          ? 'border-[var(--color-border-focus)] bg-[var(--color-surface-container-low)]'
+          : 'border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-hover)]'
+      } ${isDragging ? 'shadow-[var(--shadow-dropdown)] opacity-90' : ''}`}
+    >
+      <div className="flex items-center gap-2 px-3 py-3">
+        <button
+          type="button"
+          {...attributes}
+          {...listeners}
+          aria-label={dragLabel}
+          title={dragLabel}
+          className="flex h-8 w-8 shrink-0 cursor-grab items-center justify-center rounded-[6px] text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-surface-container-high)] hover:text-[var(--color-text-secondary)] focus:outline-none focus-visible:shadow-[var(--shadow-focus-ring)] active:cursor-grabbing"
+          style={{ touchAction: 'none' }}
+        >
+          <GripVertical className="h-4 w-4" />
+        </button>
+        <button
+          type="button"
+          onClick={onActivate}
+          aria-disabled={!onActivate}
+          className={`flex min-w-0 flex-1 items-center gap-3 rounded-[6px] text-left focus:outline-none focus-visible:shadow-[var(--shadow-focus-ring)] ${
+            onActivate ? 'cursor-pointer' : 'cursor-default'
+          }`}
+        >
+          <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${isActive ? 'bg-[var(--color-success)]' : 'bg-[var(--color-text-tertiary)]'}`} />
+          <span className="min-w-0 flex-1">
+            <span className="flex min-w-0 items-center gap-2">
+              <span className="truncate text-sm font-semibold text-[var(--color-text-primary)]">{title}</span>
+              {badges}
+            </span>
+            <span className="mt-0.5 block truncate text-xs text-[var(--color-text-tertiary)]">{subtitle}</span>
+            {result}
+          </span>
+        </button>
+        {actions && (
+          <div className="flex shrink-0 items-center gap-1 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
+            {actions}
+          </div>
+        )}
+      </div>
+      {details}
     </div>
   )
 }
@@ -689,6 +913,7 @@ function updateSettingsJsonProviderConnection(
   apiKey: string,
   preset: ProviderPreset,
   baseUrl: string,
+  proxyBaseUrl: string,
 ): string {
   try {
     const parsed = JSON.parse(raw || '{}') as { env?: Record<string, unknown> }
@@ -698,13 +923,17 @@ function updateSettingsJsonProviderConnection(
     const env = { ...existingEnv }
     delete env.ANTHROPIC_API_KEY
     delete env.ANTHROPIC_AUTH_TOKEN
-    env.ANTHROPIC_BASE_URL = apiFormat !== 'anthropic' ? 'http://127.0.0.1:3456/proxy' : baseUrl
+    env.ANTHROPIC_BASE_URL = apiFormat !== 'anthropic' ? proxyBaseUrl : baseUrl
     Object.assign(env, buildSettingsJsonAuthEnv(apiFormat, authStrategy, apiKey, preset))
     parsed.env = env
     return JSON.stringify(parsed, null, 2)
   } catch {
     return raw
   }
+}
+
+function getProviderProxyBaseUrl(): string {
+  return `${getBaseUrl().replace(/\/$/, '')}/proxy`
 }
 
 function buildFallbackPreset(provider?: SavedProvider): ProviderPreset {
@@ -725,13 +954,7 @@ function buildFallbackPreset(provider?: SavedProvider): ProviderPreset {
 }
 
 function openExternalUrl(url: string) {
-  if (!isTauriRuntime()) {
-    window.open(url, '_blank', 'noopener,noreferrer')
-    return
-  }
-
-  void import('@tauri-apps/plugin-shell')
-    .then((mod) => mod.open(url))
+  void getDesktopHost().shell.open(url)
     .catch(() => window.open(url, '_blank', 'noopener,noreferrer'))
 }
 
@@ -780,6 +1003,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
   const [settingsJson, setSettingsJson] = useState('')
   const [settingsJsonError, setSettingsJsonError] = useState<string | null>(null)
   const jsonPastedRef = useRef(false)
+  const providerProxyBaseUrl = useMemo(() => getProviderProxyBaseUrl(), [])
 
   // Load current settings.json and merge provider env vars
   useEffect(() => {
@@ -806,7 +1030,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
             ...(Object.keys(modelContextWindows).length > 0
               ? { [MODEL_CONTEXT_WINDOWS_ENV_KEY]: JSON.stringify(modelContextWindows) }
               : {}),
-            ANTHROPIC_BASE_URL: needsProxy ? 'http://127.0.0.1:3456/proxy' : baseUrl,
+            ANTHROPIC_BASE_URL: needsProxy ? providerProxyBaseUrl : baseUrl,
             ...buildSettingsJsonAuthEnv(apiFormat, authStrategy, apiKey, selectedPreset),
             ANTHROPIC_MODEL: normalizedModels.main,
             ANTHROPIC_DEFAULT_HAIKU_MODEL: normalizedModels.haiku,
@@ -820,7 +1044,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
       })
     })
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPreset.id])
+  }, [selectedPreset.id, providerProxyBaseUrl])
 
   const handlePresetChange = (preset: ProviderPreset) => {
     setSelectedPreset(preset)
@@ -916,19 +1140,19 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
   }
   const handleBaseUrlChange = (value: string) => {
     setBaseUrl(value)
-    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, authStrategy, apiKey, selectedPreset, value))
+    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, authStrategy, apiKey, selectedPreset, value, providerProxyBaseUrl))
   }
   const handleApiKeyChange = (value: string) => {
     setApiKey(value)
-    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, authStrategy, value, selectedPreset, baseUrl))
+    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, authStrategy, value, selectedPreset, baseUrl, providerProxyBaseUrl))
   }
   const handleApiFormatChange = (value: ApiFormat) => {
     setApiFormat(value)
-    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, value, authStrategy, apiKey, selectedPreset, baseUrl))
+    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, value, authStrategy, apiKey, selectedPreset, baseUrl, providerProxyBaseUrl))
   }
   const handleAuthStrategyChange = (value: ProviderAuthStrategy) => {
     setAuthStrategy(value)
-    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, value, apiKey, selectedPreset, baseUrl))
+    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, value, apiKey, selectedPreset, baseUrl, providerProxyBaseUrl))
   }
   const handleModelChange = (slot: ModelSlot, value: string) => {
     const nextModels = { ...models, [slot]: value }
@@ -1428,16 +1652,25 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
 
 // ─── General Settings ──────────────────────────────────────
 
-function GeneralSettings() {
+export function GeneralSettings() {
   const {
     thinkingEnabled,
     setThinkingEnabled,
+    autoDreamEnabled,
+    setAutoDreamEnabled,
     locale,
     setLocale,
     theme,
     setTheme,
     chatSendBehavior,
     setChatSendBehavior,
+    outputStyle,
+    outputStyles,
+    outputStyleScope,
+    outputStylesLoading,
+    outputStyleError,
+    fetchOutputStyles,
+    setOutputStyle,
     skipWebFetchPreflight,
     setSkipWebFetchPreflight,
     desktopNotificationsEnabled,
@@ -1446,6 +1679,8 @@ function GeneralSettings() {
     setWebSearch,
     network,
     setNetwork,
+    traceCapture,
+    setTraceCaptureEnabled,
     responseLanguage,
     setResponseLanguage,
     appMode,
@@ -1455,6 +1690,8 @@ function GeneralSettings() {
     uiZoom,
     setUiZoom,
   } = useSettingsStore()
+  const activeSessionId = useSessionStore((s) => s.activeSessionId)
+  const sessions = useSessionStore((s) => s.sessions)
   const t = useTranslation()
   const [webSearchDraft, setWebSearchDraft] = useState(webSearch)
   const [networkDraft, setNetworkDraft] = useState(network)
@@ -1463,6 +1700,8 @@ function GeneralSettings() {
   const [isSavingNetwork, setIsSavingNetwork] = useState(false)
   const [notificationPermission, setNotificationPermission] = useState<DesktopNotificationPermission>('default')
   const [notificationActionRunning, setNotificationActionRunning] = useState(false)
+  const [autoDreamConfirmOpen, setAutoDreamConfirmOpen] = useState(false)
+  const [autoDreamActionRunning, setAutoDreamActionRunning] = useState(false)
   const [modeSwitchConfirmOpen, setModeSwitchConfirmOpen] = useState(false)
   const [pendingMode, setPendingMode] = useState<AppMode | null>(null)
   const [pendingPortableDir, setPendingPortableDir] = useState<string | null>(null)
@@ -1479,10 +1718,22 @@ function GeneralSettings() {
   const activeConfigDir = appMode.activeConfigDir ?? (appMode.mode === 'portable' ? appMode.portableDir : null)
   const configDirSource = appMode.configDirSource ?? (appMode.mode === 'portable' ? 'portable' : 'system')
   const isEnvironmentConfigDir = configDirSource === 'environment'
+  const activeSession = useMemo(
+    () => sessions.find((session) => session.id === activeSessionId),
+    [activeSessionId, sessions],
+  )
+  const outputStyleWorkDir =
+    activeSession?.workDirExists === false
+      ? null
+      : activeSession?.workDir ?? activeSession?.projectRoot ?? null
 
   useEffect(() => {
     setWebSearchDraft(webSearch)
   }, [webSearch])
+
+  useEffect(() => {
+    void fetchOutputStyles(outputStyleWorkDir)
+  }, [fetchOutputStyles, outputStyleWorkDir])
 
   useEffect(() => {
     setNetworkDraft(network)
@@ -1507,7 +1758,7 @@ function GeneralSettings() {
   }, [])
 
   useEffect(() => {
-    if (!isTauriRuntime()) return
+    if (!isDesktopRuntime()) return
     void fetchAppMode()
   }, [fetchAppMode])
 
@@ -1517,8 +1768,12 @@ function GeneralSettings() {
 
   const LANGUAGES: Array<{ value: Locale; label: string }> = [
     { value: 'en', label: 'English' },
-    { value: 'zh', label: '中文' },
+    { value: 'zh', label: '简体中文' },
+    { value: 'zh-TW', label: '繁體中文' },
+    { value: 'jp', label: '日本語' },
+    { value: 'kr', label: '한국어' },
   ]
+
 
   const RESPONSE_LANGUAGES: Array<{ value: string; label: string }> = [
     { value: '', label: t('settings.general.responseLangDefault') },
@@ -1546,6 +1801,19 @@ function GeneralSettings() {
   ]
   const selectedResponseLanguageLabel =
     RESPONSE_LANGUAGES.find(({ value }) => value === responseLanguage)?.label ?? RESPONSE_LANGUAGES[0]!.label
+  const outputStyleItems = outputStyles.map((style) => ({
+    value: style.value,
+    label: style.label,
+    description: `${style.description} · ${getOutputStyleSourceLabel(style.source, t)}`,
+  }))
+  const selectedOutputStyle =
+    outputStyles.find((style) => style.value === outputStyle) ?? outputStyles[0]
+  const outputStyleScopeLabel = outputStyleScope === 'localSettings'
+    ? t('settings.general.outputStyleScopeLocal')
+    : t('settings.general.outputStyleScopeUser')
+  const outputStyleScopeHint = outputStyleScope === 'localSettings'
+    ? t('settings.general.outputStyleScopeLocalHint')
+    : t('settings.general.outputStyleScopeUserHint')
 
   const THEMES: Array<{ value: ThemeMode; label: string }> = [
     { value: 'white', label: t('settings.general.appearance.white') },
@@ -1602,17 +1870,32 @@ function GeneralSettings() {
     try {
       const permission = await requestDesktopNotificationPermission()
       setNotificationPermission(permission)
-      if (permission === 'granted') {
+      if (permission === 'granted' && getDesktopNotificationPlatform() !== 'win32') {
         void notifyDesktop({
           title: t('settings.general.notificationsTestTitle'),
           body: t('settings.general.notificationsTestBody'),
         })
       }
-      if (permission === 'denied') {
-        await openDesktopNotificationSettings()
-      }
     } finally {
       setNotificationActionRunning(false)
+    }
+  }
+
+  const handleAutoDreamToggle = (enabled: boolean) => {
+    if (enabled) {
+      setAutoDreamConfirmOpen(true)
+      return
+    }
+    void setAutoDreamEnabled(false)
+  }
+
+  const confirmAutoDreamEnable = async () => {
+    setAutoDreamActionRunning(true)
+    try {
+      await setAutoDreamEnabled(true)
+      setAutoDreamConfirmOpen(false)
+    } finally {
+      setAutoDreamActionRunning(false)
     }
   }
 
@@ -1712,11 +1995,27 @@ function GeneralSettings() {
     }
   }
 
+  const handleOutputStyleChange = async (value: string) => {
+    try {
+      await setOutputStyle(value, outputStyleWorkDir)
+      addToast({
+        type: 'success',
+        message: t('settings.general.outputStyleSaved'),
+      })
+    } catch {
+      // The store exposes outputStyleError below; keep the interaction local.
+    }
+  }
+
   const openPortableDirPicker = async () => {
     setModeError(null)
+    const host = getDesktopHost()
+    if (!host.capabilities.dialogs) {
+      setModeError(t('settings.general.storagePickerError'))
+      return
+    }
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog')
-      const selected = await open({
+      const selected = await host.dialogs.open({
         directory: true,
         multiple: false,
         title: t('settings.general.storageChooseDirTitle'),
@@ -1761,10 +2060,9 @@ function GeneralSettings() {
     setModeError(null)
     try {
       await setAppModeAction(pendingMode, pendingPortableDir)
-      const { invoke } = await import('@tauri-apps/api/core')
-      await invoke('prepare_for_app_mode_restart')
-      const { relaunch } = await import('@tauri-apps/plugin-process')
-      await relaunch()
+      const host = getDesktopHost()
+      await host.appMode.prepareRestart()
+      await host.appMode.restart()
     } catch (error) {
       setModeError(
         error instanceof Error
@@ -1954,16 +2252,72 @@ function GeneralSettings() {
         }
       />
 
+      {/* Output style */}
+      <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.outputStyleTitle')}</h2>
+      <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.outputStyleDescription')}</p>
+      <div className="mb-8 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-4">
+        <Dropdown<string>
+          items={outputStyleItems}
+          value={outputStyle}
+          onChange={(value) => void handleOutputStyleChange(value)}
+          width="100%"
+          maxHeight={360}
+          className="block w-full"
+          trigger={
+            <button
+              type="button"
+              aria-label={t('settings.general.outputStyleSelectLabel')}
+              disabled={outputStylesLoading}
+              className="flex min-h-10 w-full items-center gap-3 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-left text-sm text-[var(--color-text-primary)] outline-none transition-colors hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-container-low)] focus-visible:border-[var(--color-border-focus)] focus-visible:shadow-[var(--shadow-focus-ring)] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <span className="material-symbols-outlined flex-shrink-0 text-[18px] text-[var(--color-text-secondary)]">format_paint</span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate font-medium">
+                  {outputStylesLoading
+                    ? t('settings.general.outputStyleLoading')
+                    : selectedOutputStyle?.label ?? outputStyle}
+                </span>
+                {selectedOutputStyle?.description && (
+                  <span className="mt-0.5 block truncate text-xs text-[var(--color-text-tertiary)]">
+                    {selectedOutputStyle.description}
+                  </span>
+                )}
+              </span>
+              <span className="material-symbols-outlined flex-shrink-0 text-[18px] text-[var(--color-text-secondary)]">expand_more</span>
+            </button>
+          }
+        />
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-[var(--color-text-tertiary)]">
+          <span className="inline-flex items-center rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 font-medium text-[var(--color-text-secondary)]">
+            {outputStyleScopeLabel}
+          </span>
+          {selectedOutputStyle && (
+            <span className="inline-flex items-center rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1">
+              {getOutputStyleSourceLabel(selectedOutputStyle.source, t)}
+            </span>
+          )}
+          <span className="min-w-0 flex-1 leading-5">{outputStyleScopeHint}</span>
+        </div>
+        <p className="mt-2 text-xs leading-5 text-[var(--color-text-tertiary)]">
+          {t('settings.general.outputStyleRestartHint')}
+        </p>
+        {outputStyleError && (
+          <p className="mt-2 text-xs leading-5 text-[var(--color-error)]">
+            {outputStyleError}
+          </p>
+        )}
+      </div>
+
       <div className="mt-8">
         <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.thinkingTitle')}</h2>
         <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.thinkingDescription')}</p>
-        <label className="flex items-start gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
+        <label className="relative flex items-start gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
           <input
             type="checkbox"
             aria-label={t('settings.general.thinkingEnabled')}
             checked={thinkingEnabled}
             onChange={(e) => void setThinkingEnabled(e.target.checked)}
-            className="peer sr-only"
+            className={SETTINGS_CHECKBOX_INPUT_CLASS}
           />
           <SettingsCheckboxMark checked={thinkingEnabled} />
           <div className="min-w-0">
@@ -1978,16 +2332,69 @@ function GeneralSettings() {
       </div>
 
       <div className="mt-8">
+        <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.autoDreamTitle')}</h2>
+        <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.autoDreamDescription')}</p>
+        <label className="relative flex items-start gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
+          <input
+            type="checkbox"
+            aria-label={t('settings.general.autoDreamEnabled')}
+            checked={autoDreamEnabled}
+            onChange={(e) => handleAutoDreamToggle(e.target.checked)}
+            className={SETTINGS_CHECKBOX_INPUT_CLASS}
+          />
+          <SettingsCheckboxMark checked={autoDreamEnabled} />
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-[var(--color-text-primary)]">
+              {t('settings.general.autoDreamEnabled')}
+            </div>
+            <div className="text-xs text-[var(--color-text-tertiary)] mt-1 leading-5">
+              {autoDreamEnabled
+                ? t('settings.general.autoDreamHintOn')
+                : t('settings.general.autoDreamHintOff')}
+            </div>
+          </div>
+        </label>
+      </div>
+
+      <div className="mt-8">
+        <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.traceTitle')}</h2>
+        <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.traceDescription')}</p>
+        <label className="relative flex items-start gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
+          <input
+            type="checkbox"
+            aria-label={t('settings.general.traceEnabled')}
+            checked={traceCapture.enabled}
+            onChange={(e) => void setTraceCaptureEnabled(e.target.checked)}
+            className={SETTINGS_CHECKBOX_INPUT_CLASS}
+          />
+          <SettingsCheckboxMark checked={traceCapture.enabled} />
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-medium text-[var(--color-text-primary)]">
+              {t('settings.general.traceEnabled')}
+            </div>
+            <div className="text-xs text-[var(--color-text-tertiary)] mt-1 leading-5">
+              {traceCapture.enabled ? t('settings.general.traceHintOn') : t('settings.general.traceHintOff')}
+            </div>
+            {traceCapture.storageDir && (
+              <div className="mt-2 truncate rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 font-mono text-[11px] text-[var(--color-text-secondary)]">
+                {traceCapture.storageDir}
+              </div>
+            )}
+          </div>
+        </label>
+      </div>
+
+      <div className="mt-8">
         <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.notificationsTitle')}</h2>
         <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.notificationsDescription')}</p>
         <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3">
-          <label className="flex items-start gap-3 cursor-pointer">
+          <label className="relative flex items-start gap-3 cursor-pointer">
             <input
               type="checkbox"
               aria-label={t('settings.general.notificationsEnabled')}
               checked={desktopNotificationsEnabled}
               onChange={(e) => void handleDesktopNotificationsToggle(e.target.checked)}
-              className="peer sr-only"
+              className={SETTINGS_CHECKBOX_INPUT_CLASS}
             />
             <SettingsCheckboxMark checked={desktopNotificationsEnabled} />
             <div className="min-w-0 flex-1">
@@ -2204,13 +2611,13 @@ function GeneralSettings() {
       <div className="mt-8">
         <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.webFetchPreflightTitle')}</h2>
         <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.webFetchPreflightDescription')}</p>
-        <label className="flex items-start gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
+        <label className="relative flex items-start gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
           <input
             type="checkbox"
             aria-label={t('settings.general.webFetchPreflightEnabled')}
             checked={skipWebFetchPreflight}
             onChange={(e) => void setSkipWebFetchPreflight(e.target.checked)}
-            className="peer sr-only"
+            className={SETTINGS_CHECKBOX_INPUT_CLASS}
           />
           <SettingsCheckboxMark checked={skipWebFetchPreflight} />
           <div className="min-w-0">
@@ -2317,7 +2724,7 @@ function GeneralSettings() {
         </div>
       </div>
 
-      {isTauriRuntime() && (
+      {isDesktopRuntime() && (
         <div className="mt-8 border-t border-[var(--color-border)] pt-8">
           <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.storageTitle')}</h2>
           <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.storageDescription')}</p>
@@ -2470,8 +2877,46 @@ function GeneralSettings() {
         confirmVariant="primary"
         loading={modeActionRunning}
       />
+      <ConfirmDialog
+        open={autoDreamConfirmOpen}
+        onClose={() => {
+          if (!autoDreamActionRunning) setAutoDreamConfirmOpen(false)
+        }}
+        onConfirm={() => void confirmAutoDreamEnable()}
+        title={t('settings.general.autoDreamConfirmTitle')}
+        body={(
+          <div className="space-y-2">
+            <p>{t('settings.general.autoDreamConfirmKeepRunning')}</p>
+            <p>{t('settings.general.autoDreamConfirmTokenCost')}</p>
+          </div>
+        )}
+        confirmLabel={t('settings.general.autoDreamConfirmEnable')}
+        cancelLabel={t('common.cancel')}
+        confirmVariant="primary"
+        loading={autoDreamActionRunning}
+      />
     </div>
   )
+}
+
+function getOutputStyleSourceLabel(
+  source: OutputStyleSource,
+  t: (key: TranslationKey) => string,
+) {
+  switch (source) {
+    case 'built-in':
+      return t('settings.general.outputStyleSourceBuiltIn')
+    case 'userSettings':
+      return t('settings.general.outputStyleSourceUser')
+    case 'projectSettings':
+      return t('settings.general.outputStyleSourceProject')
+    case 'localSettings':
+      return t('settings.general.outputStyleSourceLocal')
+    case 'policySettings':
+      return t('settings.general.outputStyleSourcePolicy')
+    case 'plugin':
+      return t('settings.general.outputStyleSourcePlugin')
+  }
 }
 
 // ─── H5 Access Settings ──────────────────────────────────────
@@ -2489,27 +2934,44 @@ function H5AccessSettings() {
   const t = useTranslation()
   const addToast = useUIStore((s) => s.addToast)
   const [h5PublicBaseUrlDraft, setH5PublicBaseUrlDraft] = useState(extractH5AccessAddressDraft(h5Access.publicBaseUrl))
-  const [h5GeneratedToken, setH5GeneratedToken] = useState<string | null>(null)
+  const [h5FixedPortDraft, setH5FixedPortDraft] = useState(h5Access.fixedPort != null ? String(h5Access.fixedPort) : '')
+  const [h5GraceDraft, setH5GraceDraft] = useState(h5Access.disconnectGraceSeconds != null ? String(h5Access.disconnectGraceSeconds) : '')
   const [h5TokenVisible, setH5TokenVisible] = useState(false)
   const [h5EnableConfirmOpen, setH5EnableConfirmOpen] = useState(false)
   const [h5QrDataUrl, setH5QrDataUrl] = useState<string | null>(null)
   const [h5ActionRunning, setH5ActionRunning] = useState(false)
   const h5AccessUrl = h5Access.publicBaseUrl
+  // The token is persisted server-side, so the QR code and copy actions stay
+  // available across desktop restarts (issue #767).
+  const h5Token = h5Access.token
   const h5LaunchUrl = useMemo(
-    () => buildH5LaunchUrl(h5AccessUrl, h5GeneratedToken),
-    [h5AccessUrl, h5GeneratedToken],
+    () => buildH5LaunchUrl(h5AccessUrl, h5Token),
+    [h5AccessUrl, h5Token],
   )
-  const h5AccessPort = extractH5AccessPort(h5AccessUrl)
+  const h5ActivePort = h5AccessDiagnostics?.activePort != null
+    ? String(h5AccessDiagnostics.activePort)
+    : extractH5AccessPort(h5AccessUrl)
   const h5NextPublicBaseUrl = buildH5PublicBaseUrlFromHostDraft(h5PublicBaseUrlDraft, h5Access.publicBaseUrl)
-  const h5AccessDirty = h5NextPublicBaseUrl !== (h5Access.publicBaseUrl ?? null)
+  const h5NextFixedPort = parseH5FixedPortDraft(h5FixedPortDraft)
+  const h5FixedPortInvalid = h5NextFixedPort === 'invalid'
+  const h5NextGrace = parseH5GraceDraft(h5GraceDraft)
+  const h5GraceInvalid = h5NextGrace === 'invalid'
+  const h5AccessDirty = h5NextPublicBaseUrl !== (h5Access.publicBaseUrl ?? null) ||
+    (!h5FixedPortInvalid && h5NextFixedPort !== h5Access.fixedPort) ||
+    (!h5GraceInvalid && h5NextGrace !== h5Access.disconnectGraceSeconds)
+  const h5FixedPortPendingRestart = h5Access.fixedPort != null &&
+    h5ActivePort != null &&
+    String(h5Access.fixedPort) !== h5ActivePort
 
   useEffect(() => {
     setH5PublicBaseUrlDraft(extractH5AccessAddressDraft(h5Access.publicBaseUrl))
+    setH5FixedPortDraft(h5Access.fixedPort != null ? String(h5Access.fixedPort) : '')
+    setH5GraceDraft(h5Access.disconnectGraceSeconds != null ? String(h5Access.disconnectGraceSeconds) : '')
   }, [h5Access])
 
   useEffect(() => {
     let cancelled = false
-    if (!h5Access.enabled || !h5LaunchUrl || !h5GeneratedToken) {
+    if (!h5Access.enabled || !h5LaunchUrl || !h5Token) {
       setH5QrDataUrl(null)
       return () => {
         cancelled = true
@@ -2527,7 +2989,7 @@ function H5AccessSettings() {
     return () => {
       cancelled = true
     }
-  }, [h5Access.enabled, h5LaunchUrl, h5GeneratedToken])
+  }, [h5Access.enabled, h5LaunchUrl, h5Token])
 
   const runH5Action = async (action: () => Promise<void>) => {
     setH5ActionRunning(true)
@@ -2541,9 +3003,12 @@ function H5AccessSettings() {
   }
 
   const handleH5SettingsSave = async () => {
+    if (h5FixedPortInvalid || h5GraceInvalid) return
     await runH5Action(async () => {
       await updateH5AccessSettings({
         publicBaseUrl: h5NextPublicBaseUrl,
+        fixedPort: h5NextFixedPort,
+        disconnectGraceSeconds: h5NextGrace,
       })
     })
   }
@@ -2579,8 +3044,7 @@ function H5AccessSettings() {
 
   const handleH5EnableConfirm = async () => {
     await runH5Action(async () => {
-      const token = await enableH5Access()
-      setH5GeneratedToken(token)
+      await enableH5Access()
       setH5TokenVisible(false)
       setH5EnableConfirmOpen(false)
     })
@@ -2589,15 +3053,13 @@ function H5AccessSettings() {
   const handleH5Disable = async () => {
     await runH5Action(async () => {
       await disableH5Access()
-      setH5GeneratedToken(null)
       setH5TokenVisible(false)
     })
   }
 
   const handleH5Regenerate = async () => {
     await runH5Action(async () => {
-      const token = await regenerateH5AccessToken()
-      setH5GeneratedToken(token)
+      await regenerateH5AccessToken()
       setH5TokenVisible(false)
     })
   }
@@ -2704,7 +3166,7 @@ function H5AccessSettings() {
           ) : null}
 
           <div className="mt-4 grid grid-cols-1 gap-3">
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_9rem]">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_9rem_9rem]">
               <Input
                 id="h5-access-public-url"
                 label={t('settings.general.h5AccessPublicHost')}
@@ -2713,27 +3175,63 @@ function H5AccessSettings() {
                 onChange={(event) => setH5PublicBaseUrlDraft(event.target.value)}
               />
               <Input
+                id="h5-access-fixed-port"
+                label={t('settings.general.h5AccessFixedPort')}
+                value={h5FixedPortDraft}
+                placeholder={t('settings.general.h5AccessFixedPortPlaceholder')}
+                inputMode="numeric"
+                error={h5FixedPortInvalid ? t('settings.general.h5AccessFixedPortInvalid') : undefined}
+                onChange={(event) => setH5FixedPortDraft(event.target.value)}
+              />
+              <Input
                 id="h5-access-current-port"
                 label={t('settings.general.h5AccessCurrentPort')}
-                value={h5AccessPort ?? t('settings.general.h5AccessCurrentPortUnknown')}
+                value={h5ActivePort ?? t('settings.general.h5AccessCurrentPortUnknown')}
                 readOnly
                 className="text-[var(--color-text-tertiary)]"
               />
             </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-[9rem_minmax(0,1fr)] sm:items-start">
+              <Input
+                id="h5-access-disconnect-grace"
+                label={t('settings.general.h5AccessDisconnectGrace')}
+                value={h5GraceDraft}
+                placeholder={t('settings.general.h5AccessDisconnectGracePlaceholder')}
+                inputMode="numeric"
+                error={h5GraceInvalid ? t('settings.general.h5AccessDisconnectGraceInvalid') : undefined}
+                onChange={(event) => setH5GraceDraft(event.target.value)}
+              />
+              <p className="text-xs leading-5 text-[var(--color-text-tertiary)] sm:pt-7">
+                {t('settings.general.h5AccessDisconnectGraceHint')}
+              </p>
+            </div>
             <div className="flex items-center justify-between gap-3">
               <p className="text-xs text-[var(--color-text-tertiary)]">
                 {t('settings.general.h5AccessOpenHint')}
+                {' '}
+                {t('settings.general.h5AccessFixedPortHint')}
               </p>
               <Button
                 size="sm"
                 variant="secondary"
                 onClick={() => void handleH5SettingsSave()}
-                disabled={!h5AccessDirty || h5ActionRunning}
+                disabled={!h5AccessDirty || h5FixedPortInvalid || h5GraceInvalid || h5ActionRunning}
                 aria-label={t('settings.general.h5AccessSave')}
               >
                 {t('settings.general.h5AccessSave')}
               </Button>
             </div>
+            {h5FixedPortPendingRestart && (
+              <div
+                data-testid="h5-access-fixed-port-restart-note"
+                className="rounded-lg border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/10 px-3 py-2 text-xs leading-5 text-[var(--color-text-primary)]"
+              >
+                {t('settings.general.h5AccessFixedPortRestartNote', {
+                  fixedPort: String(h5Access.fixedPort),
+                  activePort: h5ActivePort ?? '',
+                })}
+              </div>
+            )}
           </div>
 
           {h5AccessUrl && (
@@ -2785,7 +3283,7 @@ function H5AccessSettings() {
                     {t('settings.general.h5AccessQrTitle')}
                   </div>
                   <p className="mt-1 text-xs leading-5 text-[var(--color-text-tertiary)]">
-                    {h5GeneratedToken
+                    {h5Token
                       ? t('settings.general.h5AccessQrHint')
                       : t('settings.general.h5AccessQrRefreshHint')}
                   </p>
@@ -2799,19 +3297,19 @@ function H5AccessSettings() {
                       size="sm"
                       variant="secondary"
                       icon={<Copy className="h-3.5 w-3.5" aria-hidden="true" />}
-                      disabled={!h5LaunchUrl || !h5GeneratedToken}
+                      disabled={!h5LaunchUrl || !h5Token}
                       onClick={() => void handleH5LaunchUrlCopy()}
                     >
                       {t('settings.general.h5AccessCopyLaunchUrl')}
                     </Button>
                     <Button
                       size="sm"
-                      variant={h5GeneratedToken ? 'secondary' : 'primary'}
+                      variant={h5Token ? 'secondary' : 'primary'}
                       icon={<RotateCw className="h-3.5 w-3.5" aria-hidden="true" />}
                       loading={h5ActionRunning}
                       onClick={() => void handleH5Regenerate()}
                     >
-                      {h5GeneratedToken ? t('settings.general.h5AccessRegenerate') : t('settings.general.h5AccessGenerateToken')}
+                      {h5Token ? t('settings.general.h5AccessRegenerate') : t('settings.general.h5AccessGenerateToken')}
                     </Button>
                   </div>
                 </div>
@@ -2827,8 +3325,8 @@ function H5AccessSettings() {
                     {t('settings.general.h5AccessTokenPreview')}
                   </div>
                   <div className="mt-1 break-all text-sm text-[var(--color-text-primary)]">
-                    {h5TokenVisible && h5GeneratedToken
-                      ? h5GeneratedToken
+                    {h5TokenVisible && h5Token
+                      ? h5Token
                       : h5Access.tokenPreview || t('settings.general.h5AccessTokenNotAvailable')}
                   </div>
                 </div>
@@ -2837,7 +3335,7 @@ function H5AccessSettings() {
                     size="sm"
                     variant="secondary"
                     icon={h5TokenVisible ? <EyeOff className="h-3.5 w-3.5" aria-hidden="true" /> : <Eye className="h-3.5 w-3.5" aria-hidden="true" />}
-                    disabled={!h5GeneratedToken}
+                    disabled={!h5Token}
                     onClick={() => setH5TokenVisible((visible) => !visible)}
                   >
                     {h5TokenVisible ? t('settings.general.h5AccessHideToken') : t('settings.general.h5AccessShowToken')}
@@ -3482,13 +3980,12 @@ function AboutSettings() {
   useEffect(() => {
     let cancelled = false
 
-    import('@tauri-apps/api/app')
-      .then((mod) => mod.getVersion())
+    getDesktopHost().app.getVersion()
       .then((value) => {
         if (!cancelled) setVersion(value)
       })
       .catch(() => {
-        if (!cancelled) setVersion('0.1.0')
+        if (!cancelled) setVersion('')
       })
 
     return () => {
@@ -3506,7 +4003,7 @@ function AboutSettings() {
   }, [updateProxy])
 
   const openUrl = (url: string) => {
-    import('@tauri-apps/plugin-shell').then((mod) => mod.open(url)).catch(() => window.open(url, '_blank'))
+    void getDesktopHost().shell.open(url).catch(() => window.open(url, '_blank'))
   }
 
   const checkedAtText =
@@ -3582,7 +4079,7 @@ function AboutSettings() {
   return (
     <div className="w-full min-w-0 max-w-lg mx-auto flex flex-col items-center py-6">
       {/* Logo + App Name + Version */}
-      <img src="/app-icon.png" alt="Claude Code Haha" className="w-20 h-20 mb-4" />
+      <img src={publicAssetPath('app-icon.png')} alt="Claude Code Haha" className="w-20 h-20 mb-4" />
       <h1 className="text-xl font-bold text-[var(--color-text-primary)]">Claude Code Haha</h1>
       {version && (
         <div className="mt-1 flex items-center gap-2 text-xs text-[var(--color-text-tertiary)]">
@@ -3603,7 +4100,7 @@ function AboutSettings() {
           onClick={() => openUrl(GITHUB_REPO)}
           className="w-full flex items-center gap-3 px-4 py-3 rounded-xl border border-[var(--color-border)] hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
         >
-          <img src="/icons/github.svg" alt="GitHub" className="w-5 h-5 opacity-70" />
+          <img src={publicAssetPath('icons/github.svg')} alt="GitHub" className="w-5 h-5 opacity-70" />
           <div className="flex-1 text-left">
             <div className="text-sm font-medium text-[var(--color-text-primary)]">NanmiCoder/cc-haha</div>
             <div className="text-xs text-[var(--color-text-tertiary)]">{t('settings.about.starHint')}</div>
@@ -3809,7 +4306,7 @@ function AboutSettings() {
           onClick={() => openUrl(AUTHOR_GITHUB)}
           className="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
         >
-          <img src="/icons/github.svg" alt="GitHub" className="w-4 h-4 opacity-60" />
+          <img src={publicAssetPath('icons/github.svg')} alt="GitHub" className="w-4 h-4 opacity-60" />
           <span className="text-sm text-[var(--color-text-primary)]">程序员阿江-Relakkes</span>
           <span className="text-xs text-[var(--color-text-tertiary)] ml-auto">GitHub</span>
         </button>
@@ -3825,7 +4322,7 @@ function AboutSettings() {
               onClick={() => openUrl(link.url)}
               className="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
             >
-              <img src={link.icon} alt={link.name} className="w-4 h-4 opacity-60" />
+              <img src={publicAssetPath(link.icon)} alt={link.name} className="w-4 h-4 opacity-60" />
               <span className="text-sm text-[var(--color-text-primary)]">{link.label}</span>
               <span className="text-xs text-[var(--color-text-tertiary)] ml-auto">{link.name}</span>
             </button>

@@ -1516,6 +1516,8 @@ export function WorkspacePanel({ sessionId, embedded = false }: WorkspacePanelPr
           </button>
           <WorkspaceFileOpenWith
             absolutePath={resolveWorkspaceAttachmentPath(status?.workDir, fileContextMenu.path)}
+            sessionId={sessionId}
+            workspacePath={fileContextMenu.isDirectory ? undefined : fileContextMenu.path}
             onAfterSelect={() => setFileContextMenu(null)}
           />
         </div>

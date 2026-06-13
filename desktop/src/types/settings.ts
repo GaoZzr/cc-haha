@@ -14,6 +14,28 @@ export type WebSearchMode = 'auto' | 'anthropic' | 'tavily' | 'brave' | 'disable
 
 export type ChatSendBehavior = 'enter' | 'modifierEnter'
 
+export type OutputStyleSource =
+  | 'built-in'
+  | 'userSettings'
+  | 'projectSettings'
+  | 'localSettings'
+  | 'policySettings'
+  | 'plugin'
+
+export type OutputStyleOption = {
+  value: string
+  label: string
+  description: string
+  source: OutputStyleSource
+}
+
+export type OutputStylesResponse = {
+  outputStyle: string
+  styles: OutputStyleOption[]
+  scope: 'userSettings' | 'localSettings'
+  workDir: string | null
+}
+
 export type WebSearchSettings = {
   mode?: WebSearchMode
   tavilyApiKey?: string
@@ -41,9 +63,15 @@ export type NetworkSettings = {
 
 export type H5AccessSettings = {
   enabled: boolean
+  /** Full token, recoverable at any time from the desktop app. Null for pre-#767 data until the token is regenerated. */
+  token: string | null
   tokenPreview: string | null
   allowedOrigins: string[]
   publicBaseUrl: string | null
+  /** Preferred fixed server port. Applied by the Tauri launcher on next app start. */
+  fixedPort: number | null
+  /** Idle grace period (seconds) before a disconnected, idle session's CLI is stopped. null = built-in 30s default. */
+  disconnectGraceSeconds: number | null
 }
 
 export type H5HostStaleness = 'ok' | 'unreachable' | 'proxy' | 'unset'
@@ -54,6 +82,7 @@ export type H5AccessDiagnostics = {
   effectivePublicBaseUrl: string | null
   suggestedHost: string | null
   localInterfaceHosts: string[]
+  activePort?: number
 }
 
 export type DesktopTerminalStartupShell =
@@ -80,9 +109,11 @@ export type UserSettings = {
   modelContext?: string
   effort?: EffortLevel
   alwaysThinkingEnabled?: boolean
+  autoDreamEnabled?: boolean
   permissionMode?: PermissionMode
   theme?: ThemeMode
   chatSendBehavior?: ChatSendBehavior
+  outputStyle?: string
   skipWebFetchPreflight?: boolean
   desktopNotificationsEnabled?: boolean
   webSearch?: WebSearchSettings

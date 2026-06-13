@@ -185,6 +185,97 @@ describe('ConversationService', () => {
     })
   })
 
+  it('should forward explicit permission updates from desktop plan approval', () => {
+    const svc = new ConversationService()
+    const sent: unknown[] = []
+    const permissionUpdates = [
+      {
+        type: 'addRules',
+        rules: [{ toolName: 'Bash', ruleContent: 'prompt: run tests' }],
+        behavior: 'allow',
+        destination: 'session',
+      },
+    ]
+
+    ;(svc as any).sessions.set('session-1', {
+      proc: null,
+      outputCallbacks: [],
+      workDir: process.cwd(),
+      sdkToken: 'token',
+      sdkSocket: {
+        send(data: string) {
+          sent.push(JSON.parse(data))
+        },
+      },
+      pendingOutbound: [],
+      stderrLines: [],
+      sdkMessages: [],
+      pendingPermissionRequests: new Map(),
+    })
+
+    const result = svc.respondToPermission(
+      'session-1',
+      'req-1',
+      true,
+      undefined,
+      undefined,
+      undefined,
+      permissionUpdates,
+    )
+
+    expect(result).toBe(true)
+    expect(sent[0]).toMatchObject({
+      type: 'control_response',
+      response: {
+        response: {
+          behavior: 'allow',
+          updatedPermissions: permissionUpdates,
+        },
+      },
+    })
+  })
+
+  it('should forward explicit denial feedback from desktop plan rejection', () => {
+    const svc = new ConversationService()
+    const sent: unknown[] = []
+
+    ;(svc as any).sessions.set('session-1', {
+      proc: null,
+      outputCallbacks: [],
+      workDir: process.cwd(),
+      sdkToken: 'token',
+      sdkSocket: {
+        send(data: string) {
+          sent.push(JSON.parse(data))
+        },
+      },
+      pendingOutbound: [],
+      stderrLines: [],
+      sdkMessages: [],
+      pendingPermissionRequests: new Map(),
+    })
+
+    const result = svc.respondToPermission(
+      'session-1',
+      'req-1',
+      false,
+      undefined,
+      undefined,
+      'Add rollback steps before implementation.',
+    )
+
+    expect(result).toBe(true)
+    expect(sent[0]).toMatchObject({
+      type: 'control_response',
+      response: {
+        response: {
+          behavior: 'deny',
+          message: 'Add rollback steps before implementation.',
+        },
+      },
+    })
+  })
+
   it('should send set_permission_mode requests to active sessions', () => {
     const svc = new ConversationService()
     const sent: unknown[] = []
@@ -524,6 +615,84 @@ describe('ConversationService', () => {
         delete process.env.NODE_ENV
       } else {
         process.env.NODE_ENV = previousNodeEnv
+      }
+      await fs.rm(tmpConfigDir, { recursive: true, force: true })
+      await fs.rm(workDir, { recursive: true, force: true })
+    }
+  })
+
+  it('should use active provider model context windows for transcript estimates', async () => {
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    const previousNodeEnv = process.env.NODE_ENV
+    const previousModelContextWindows = process.env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS
+    const tmpConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-transcript-provider-'))
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workdir-provider-'))
+    process.env.CLAUDE_CONFIG_DIR = tmpConfigDir
+    process.env.NODE_ENV = 'development'
+    delete process.env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS
+
+    try {
+      const providerService = new ProviderService()
+      const provider = await providerService.addProvider({
+        presetId: 'minimax',
+        name: 'MiniMax',
+        apiKey: 'provider-key',
+        authStrategy: 'auth_token',
+        baseUrl: 'https://api.minimaxi.com/anthropic',
+        apiFormat: 'anthropic',
+        models: {
+          main: 'MiniMax-M3',
+          haiku: 'MiniMax-M3',
+          sonnet: 'MiniMax-M3',
+          opus: 'MiniMax-M3',
+        },
+        modelContextWindows: {
+          'MiniMax-M3': 1_000_000,
+        },
+      })
+      await providerService.activateProvider(provider.id)
+
+      const svc = new SessionService()
+      const { sessionId } = await svc.createSession(workDir)
+      const found = await svc.findSessionFile(sessionId)
+      expect(found).not.toBeNull()
+
+      await fs.appendFile(found!.filePath, JSON.stringify({
+        type: 'assistant',
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-04-27T12:00:00.000Z',
+        cwd: workDir,
+        version: '999.0.0-test',
+        message: {
+          role: 'assistant',
+          model: 'MiniMax-M3',
+          content: [{ type: 'text', text: 'hello' }],
+          usage: {
+            input_tokens: 100,
+            output_tokens: 20,
+          },
+        },
+      }) + '\n')
+
+      const contextEstimate = await svc.getTranscriptContextEstimate(sessionId)
+
+      expect(contextEstimate?.model).toBe('MiniMax-M3')
+      expect(contextEstimate?.rawMaxTokens).toBe(1_000_000)
+    } finally {
+      if (previousConfigDir === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      }
+      if (previousNodeEnv === undefined) {
+        delete process.env.NODE_ENV
+      } else {
+        process.env.NODE_ENV = previousNodeEnv
+      }
+      if (previousModelContextWindows === undefined) {
+        delete process.env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS
+      } else {
+        process.env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS = previousModelContextWindows
       }
       await fs.rm(tmpConfigDir, { recursive: true, force: true })
       await fs.rm(workDir, { recursive: true, force: true })
@@ -888,11 +1057,10 @@ describe('WebSocket Chat Integration', () => {
     )
     await fs.mkdir(path.join(tmpDir, 'projects'), { recursive: true })
 
-    const port = 15000 + Math.floor(Math.random() * 1000)
     const { startServer } = await import('../index.js')
-    server = startServer(port, '127.0.0.1')
-    baseUrl = `http://127.0.0.1:${port}`
-    wsUrl = `ws://127.0.0.1:${port}`
+    server = startServer(0, '127.0.0.1')
+    baseUrl = `http://127.0.0.1:${server.port}`
+    wsUrl = `ws://127.0.0.1:${server.port}`
   })
 
   afterAll(async () => {
@@ -1106,6 +1274,106 @@ describe('WebSocket Chat Integration', () => {
     expect(messages[titleIndex].title).toBe('开始优化UI')
     expect(titleIndex).toBeLessThan(completionIndex)
   })
+
+  it('refreshes the first-turn AI title from the completed assistant transcript', async () => {
+    const providerConfigPath = path.join(tmpDir, 'cc-haha', 'providers.json')
+    const originalProviderConfig = await fs.readFile(providerConfigPath, 'utf-8').catch(() => null)
+    const upstreamInputs: string[] = []
+    const titleModelServer = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(req) {
+        const body = await req.json() as {
+          messages?: Array<{ content?: unknown }>
+        }
+        const input = String(body.messages?.[0]?.content ?? '')
+        upstreamInputs.push(input)
+        const title = input.includes('Echo: 看一下这个搜索结果')
+          ? 'Google 搜索企查查结果'
+          : 'Premature user title'
+        return Response.json({
+          content: [{ type: 'text', text: JSON.stringify({ title }) }],
+        })
+      },
+    })
+
+    try {
+      await fs.mkdir(path.dirname(providerConfigPath), { recursive: true })
+      await fs.writeFile(
+        providerConfigPath,
+        JSON.stringify({
+          activeId: 'title-transcript-provider',
+          providers: [
+            {
+              id: 'title-transcript-provider',
+              presetId: 'minimax',
+              name: 'Title Transcript Provider',
+              apiKey: 'test-key',
+              baseUrl: `http://127.0.0.1:${titleModelServer.port}/anthropic`,
+              apiFormat: 'anthropic',
+              models: {
+                main: 'minimax-main',
+                haiku: 'minimax-haiku',
+                sonnet: 'minimax-main',
+                opus: 'minimax-main',
+              },
+            },
+          ],
+        }, null, 2),
+        'utf-8',
+      )
+
+      const sessionId = `title-transcript-${crypto.randomUUID()}`
+      const messages: any[] = []
+      const ws = new WebSocket(`${wsUrl}/ws/${sessionId}`)
+
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          ws.close()
+          reject(new Error('Timed out waiting for transcript-backed session title'))
+        }, 8000)
+
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data as string)
+          messages.push(msg)
+          if (msg.type === 'connected') {
+            ws.send(JSON.stringify({
+              type: 'user_message',
+              content: '看一下这个搜索结果，请一条一条给我列出来',
+            }))
+            return
+          }
+          if (msg.type === 'session_title_updated' && msg.title === 'Google 搜索企查查结果') {
+            clearTimeout(timeout)
+            ws.close()
+            resolve()
+          }
+          if (msg.type === 'error') {
+            clearTimeout(timeout)
+            ws.close()
+            reject(new Error(msg.message))
+          }
+        }
+        ws.onerror = () => {
+          clearTimeout(timeout)
+          reject(new Error(`WebSocket error for title transcript session ${sessionId}`))
+        }
+      })
+
+      const titleMessages = messages.filter((msg) => msg.type === 'session_title_updated')
+      expect(titleMessages[0]?.title).toBe('看一下这个搜索结果，请一条一条给我列出来')
+      expect(titleMessages.map((msg) => msg.title)).toContain('Google 搜索企查查结果')
+      expect(upstreamInputs.some((input) => input.includes('Echo: 看一下这个搜索结果'))).toBe(true)
+      expect(upstreamInputs.some((input) => input.includes('Return the title in Chinese.'))).toBe(true)
+    } finally {
+      titleModelServer.stop(true)
+      if (originalProviderConfig === null) {
+        await fs.rm(providerConfigPath, { force: true })
+      } else {
+        await fs.writeFile(providerConfigPath, originalProviderConfig, 'utf-8')
+      }
+    }
+  }, 10000)
 
   it('uses the /goal objective for the derived session title', async () => {
     const sessionId = `title-goal-${crypto.randomUUID()}`
@@ -1698,7 +1966,7 @@ describe('WebSocket Chat Integration', () => {
     const { sessionId } = await createRes.json() as { sessionId: string }
 
     const originalStartSession = conversationService.startSession.bind(conversationService)
-    const startCalls: Array<{ sessionId: string }> = []
+    const startCalls: Array<{ sessionId: string; options?: Record<string, unknown> }> = []
 
     conversationService.startSession = (async function patchedStartSession(
       sid: string,
@@ -1706,7 +1974,7 @@ describe('WebSocket Chat Integration', () => {
       sdkUrl: string,
       options?: { permissionMode?: string; model?: string; effort?: string; thinking?: 'enabled' | 'adaptive' | 'disabled'; providerId?: string | null },
     ) {
-      startCalls.push({ sessionId: sid })
+      startCalls.push({ sessionId: sid, options: options as Record<string, unknown> | undefined })
       return originalStartSession(sid, workDir, sdkUrl, options)
     }) as typeof conversationService.startSession
 
@@ -1795,6 +2063,8 @@ describe('WebSocket Chat Integration', () => {
       await completion
 
       expect(startCalls).toHaveLength(1)
+      expect(startCalls[0]!.sessionId).toBe(sessionId)
+      expect(startCalls[0]!.options?.resumeInterruptedTurn).toBe(false)
       expect(messages.some((msg) => msg.type === 'content_delta')).toBe(true)
       expect(messages.some((msg) => msg.type === 'message_complete')).toBe(true)
       expect(messages.some((msg) => msg.type === 'error')).toBe(false)
@@ -2337,6 +2607,548 @@ describe('WebSocket Chat Integration', () => {
     }
   }, 20_000)
 
+  it('should clear active turn tracking when sending a user message fails after startup', async () => {
+    const providerService = new ProviderService()
+    const provider = await providerService.addProvider({
+      presetId: 'custom',
+      name: 'Provider Send Failure Runtime',
+      apiKey: 'key-send-failure-runtime',
+      baseUrl: 'http://127.0.0.1:1/anthropic',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'send-failure-main',
+        haiku: 'send-failure-haiku',
+        sonnet: 'send-failure-sonnet',
+        opus: 'send-failure-opus',
+      },
+    })
+
+    const createRes = await fetch(`${baseUrl}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workDir: process.cwd() }),
+    })
+    expect(createRes.status).toBe(201)
+    const { sessionId } = await createRes.json() as { sessionId: string }
+
+    const originalStartSession = conversationService.startSession.bind(conversationService)
+    const originalSendMessage = conversationService.sendMessage.bind(conversationService)
+    const startCalls: Array<{
+      sessionId: string
+      options: { permissionMode?: string; model?: string; effort?: string; providerId?: string | null } | undefined
+    }> = []
+
+    conversationService.startSession = (async function patchedStartSession(
+      sid: string,
+      workDir: string,
+      sdkUrl: string,
+      options?: { permissionMode?: string; model?: string; effort?: string; thinking?: 'enabled' | 'adaptive' | 'disabled'; providerId?: string | null },
+    ) {
+      startCalls.push({ sessionId: sid, options })
+      return originalStartSession(sid, workDir, sdkUrl, options)
+    }) as typeof conversationService.startSession
+    conversationService.sendMessage = (async () => false) as typeof conversationService.sendMessage
+
+    const ws = new WebSocket(`${wsUrl}/ws/${sessionId}`)
+    const messages: any[] = []
+    let sendFailureIdle = false
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          ws.close()
+          reject(new Error(`Timed out waiting for send-failure runtime switch for session ${sessionId}`))
+        }, 10_000)
+
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data as string)
+          messages.push(msg)
+
+          if (msg.type === 'connected') {
+            ws.send(JSON.stringify({ type: 'user_message', content: 'send failure active turn cleanup' }))
+            return
+          }
+
+          if (msg.type === 'error' && msg.code !== 'CLI_NOT_RUNNING') {
+            clearTimeout(timeout)
+            ws.close()
+            reject(new Error(msg.message))
+            return
+          }
+
+          if (msg.type === 'status' && msg.state === 'idle' && !sendFailureIdle) {
+            if (!messages.some((item) => item.type === 'error' && item.code === 'CLI_NOT_RUNNING')) {
+              return
+            }
+            sendFailureIdle = true
+            ws.send(JSON.stringify({
+              type: 'set_runtime_config',
+              providerId: provider.id,
+              modelId: 'send-failure-sonnet',
+            }))
+            return
+          }
+
+          if (msg.type === 'status' && msg.state === 'idle' && sendFailureIdle && startCalls.length > 1) {
+            clearTimeout(timeout)
+            ws.close()
+            resolve()
+          }
+        }
+
+        ws.onerror = () => {
+          clearTimeout(timeout)
+          reject(new Error(`WebSocket error for send-failure runtime switch session ${sessionId}`))
+        }
+      })
+
+      expect(startCalls).toHaveLength(2)
+      expect(startCalls[1]).toMatchObject({
+        sessionId,
+        options: {
+          providerId: provider.id,
+          model: 'send-failure-sonnet',
+        },
+      })
+    } finally {
+      ws.close()
+      conversationService.startSession = originalStartSession
+      conversationService.sendMessage = originalSendMessage
+      conversationService.stopSession(sessionId)
+    }
+  }, 20_000)
+
+  it('should defer runtime model switches until the active turn completes', async () => {
+    await withMockStreamDelay(350, async () => {
+      const providerService = new ProviderService()
+      const providerA = await providerService.addProvider({
+        presetId: 'custom',
+        name: 'Provider Active Runtime A',
+        apiKey: 'key-active-runtime-a',
+        baseUrl: 'http://127.0.0.1:1/anthropic',
+        apiFormat: 'anthropic',
+        models: {
+          main: 'active-a-main',
+          haiku: 'active-a-haiku',
+          sonnet: 'active-a-sonnet',
+          opus: 'active-a-opus',
+        },
+      })
+      const providerB = await providerService.addProvider({
+        presetId: 'custom',
+        name: 'Provider Active Runtime B',
+        apiKey: 'key-active-runtime-b',
+        baseUrl: 'http://127.0.0.1:1/anthropic',
+        apiFormat: 'anthropic',
+        models: {
+          main: 'active-b-main',
+          haiku: 'active-b-haiku',
+          sonnet: 'active-b-sonnet',
+          opus: 'active-b-opus',
+        },
+      })
+
+      const createRes = await fetch(`${baseUrl}/api/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workDir: process.cwd() }),
+      })
+      expect(createRes.status).toBe(201)
+      const { sessionId } = await createRes.json() as { sessionId: string }
+
+      const originalStartSession = conversationService.startSession.bind(conversationService)
+      const startCalls: Array<{
+        sessionId: string
+        options: { permissionMode?: string; model?: string; effort?: string; providerId?: string | null } | undefined
+      }> = []
+
+      conversationService.startSession = (async function patchedStartSession(
+        sid: string,
+        workDir: string,
+        sdkUrl: string,
+        options?: { permissionMode?: string; model?: string; effort?: string; thinking?: 'enabled' | 'adaptive' | 'disabled'; providerId?: string | null },
+      ) {
+        startCalls.push({ sessionId: sid, options })
+        return originalStartSession(sid, workDir, sdkUrl, options)
+      }) as typeof conversationService.startSession
+
+      const ws = new WebSocket(`${wsUrl}/ws/${sessionId}`)
+      let switchTriggered = false
+      let turnComplete = false
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            ws.close()
+            reject(new Error(`Timed out waiting for active-turn runtime switch for session ${sessionId}`))
+          }, 10_000)
+
+          ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data as string)
+
+            if (msg.type === 'connected') {
+              ws.send(JSON.stringify({
+                type: 'set_runtime_config',
+                providerId: providerA.id,
+                modelId: 'active-a-sonnet',
+              }))
+              ws.send(JSON.stringify({ type: 'user_message', content: 'active turn runtime switch' }))
+              return
+            }
+
+            if (msg.type === 'error') {
+              clearTimeout(timeout)
+              ws.close()
+              reject(new Error(msg.message))
+              return
+            }
+
+            if (
+              msg.type === 'content_delta' &&
+              typeof msg.text === 'string' &&
+              msg.text.includes('active turn runtime switch') &&
+              !switchTriggered
+            ) {
+              switchTriggered = true
+              ws.send(JSON.stringify({
+                type: 'set_runtime_config',
+                providerId: providerB.id,
+                modelId: 'active-b-opus',
+              }))
+              return
+            }
+
+            if (
+              msg.type === 'status' &&
+              msg.state === 'idle' &&
+              switchTriggered &&
+              !turnComplete &&
+              startCalls.length > 1
+            ) {
+              clearTimeout(timeout)
+              ws.close()
+              reject(new Error('Runtime restarted before the active turn completed'))
+              return
+            }
+
+            if (msg.type === 'message_complete' && switchTriggered && !turnComplete) {
+              turnComplete = true
+              expect(startCalls).toHaveLength(1)
+              return
+            }
+
+            if (msg.type === 'status' && msg.state === 'idle' && turnComplete) {
+              clearTimeout(timeout)
+              ws.close()
+              resolve()
+            }
+          }
+
+          ws.onerror = () => {
+            clearTimeout(timeout)
+            reject(new Error(`WebSocket error for active-turn runtime switch session ${sessionId}`))
+          }
+        })
+
+        expect(startCalls).toHaveLength(2)
+        expect(startCalls[0]).toMatchObject({
+          sessionId,
+          options: {
+            providerId: providerA.id,
+            model: 'active-a-sonnet',
+          },
+        })
+        expect(startCalls[1]).toMatchObject({
+          sessionId,
+          options: {
+            providerId: providerB.id,
+            model: 'active-b-opus',
+          },
+        })
+      } finally {
+        ws.close()
+        conversationService.startSession = originalStartSession
+        conversationService.stopSession(sessionId)
+      }
+    })
+  }, 20_000)
+
+  it('should surface deferred runtime restart failures after the active turn completes', async () => {
+    await withMockStreamDelay(350, async () => {
+      const providerService = new ProviderService()
+      const providerA = await providerService.addProvider({
+        presetId: 'custom',
+        name: 'Provider Deferred Failure A',
+        apiKey: 'key-deferred-failure-a',
+        baseUrl: 'http://127.0.0.1:1/anthropic',
+        apiFormat: 'anthropic',
+        models: {
+          main: 'deferred-failure-a-main',
+          haiku: 'deferred-failure-a-haiku',
+          sonnet: 'deferred-failure-a-sonnet',
+          opus: 'deferred-failure-a-opus',
+        },
+      })
+      const providerB = await providerService.addProvider({
+        presetId: 'custom',
+        name: 'Provider Deferred Failure B',
+        apiKey: 'key-deferred-failure-b',
+        baseUrl: 'http://127.0.0.1:1/anthropic',
+        apiFormat: 'anthropic',
+        models: {
+          main: 'deferred-failure-b-main',
+          haiku: 'deferred-failure-b-haiku',
+          sonnet: 'deferred-failure-b-sonnet',
+          opus: 'deferred-failure-b-opus',
+        },
+      })
+
+      const createRes = await fetch(`${baseUrl}/api/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workDir: process.cwd() }),
+      })
+      expect(createRes.status).toBe(201)
+      const { sessionId } = await createRes.json() as { sessionId: string }
+
+      const originalStartSession = conversationService.startSession.bind(conversationService)
+      const startCalls: Array<{
+        sessionId: string
+        options: { permissionMode?: string; model?: string; effort?: string; providerId?: string | null } | undefined
+      }> = []
+
+      conversationService.startSession = (async function patchedStartSession(
+        sid: string,
+        workDir: string,
+        sdkUrl: string,
+        options?: { permissionMode?: string; model?: string; effort?: string; thinking?: 'enabled' | 'adaptive' | 'disabled'; providerId?: string | null },
+      ) {
+        startCalls.push({ sessionId: sid, options })
+        if (startCalls.length > 1) {
+          throw new Error('deferred restart failed')
+        }
+        return originalStartSession(sid, workDir, sdkUrl, options)
+      }) as typeof conversationService.startSession
+
+      const ws = new WebSocket(`${wsUrl}/ws/${sessionId}`)
+      let switchTriggered = false
+      let turnComplete = false
+      let restartError = false
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            ws.close()
+            reject(new Error(`Timed out waiting for deferred restart failure for session ${sessionId}`))
+          }, 10_000)
+
+          ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data as string)
+
+            if (msg.type === 'connected') {
+              ws.send(JSON.stringify({
+                type: 'set_runtime_config',
+                providerId: providerA.id,
+                modelId: 'deferred-failure-a-sonnet',
+              }))
+              ws.send(JSON.stringify({ type: 'user_message', content: 'deferred runtime restart failure' }))
+              return
+            }
+
+            if (
+              msg.type === 'content_delta' &&
+              typeof msg.text === 'string' &&
+              msg.text.includes('deferred runtime restart failure') &&
+              !switchTriggered
+            ) {
+              switchTriggered = true
+              ws.send(JSON.stringify({
+                type: 'set_runtime_config',
+                providerId: providerB.id,
+                modelId: 'deferred-failure-b-opus',
+              }))
+              return
+            }
+
+            if (msg.type === 'message_complete' && switchTriggered && !turnComplete) {
+              turnComplete = true
+              expect(startCalls).toHaveLength(1)
+              return
+            }
+
+            if (msg.type === 'error') {
+              if (!turnComplete) {
+                clearTimeout(timeout)
+                ws.close()
+                reject(new Error(`Deferred restart failed before turn completion: ${msg.message}`))
+                return
+              }
+              restartError = msg.code === 'CLI_RESTART_FAILED' &&
+                typeof msg.message === 'string' &&
+                msg.message.includes('deferred restart failed')
+              return
+            }
+
+            if (msg.type === 'status' && msg.state === 'idle' && restartError) {
+              clearTimeout(timeout)
+              ws.close()
+              resolve()
+            }
+          }
+
+          ws.onerror = () => {
+            clearTimeout(timeout)
+            reject(new Error(`WebSocket error for deferred restart failure session ${sessionId}`))
+          }
+        })
+
+        expect(switchTriggered).toBe(true)
+        expect(turnComplete).toBe(true)
+        expect(restartError).toBe(true)
+        expect(startCalls).toHaveLength(2)
+        expect(startCalls[1]).toMatchObject({
+          sessionId,
+          options: {
+            providerId: providerB.id,
+            model: 'deferred-failure-b-opus',
+          },
+        })
+      } finally {
+        ws.close()
+        conversationService.startSession = originalStartSession
+        conversationService.stopSession(sessionId)
+      }
+    })
+  }, 20_000)
+
+  it('should defer bypass permission restarts until the active turn completes', async () => {
+    await withMockStreamDelay(350, async () => {
+      await fetch(`${baseUrl}/api/permissions/mode`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'default' }),
+      })
+
+      const createRes = await fetch(`${baseUrl}/api/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workDir: process.cwd() }),
+      })
+      expect(createRes.status).toBe(201)
+      const { sessionId } = await createRes.json() as { sessionId: string }
+
+      const originalStartSession = conversationService.startSession.bind(conversationService)
+      const startCalls: Array<{
+        sessionId: string
+        options: { permissionMode?: string; model?: string; effort?: string; providerId?: string | null } | undefined
+      }> = []
+
+      conversationService.startSession = (async function patchedStartSession(
+        sid: string,
+        workDir: string,
+        sdkUrl: string,
+        options?: { permissionMode?: string; model?: string; effort?: string; thinking?: 'enabled' | 'adaptive' | 'disabled'; providerId?: string | null },
+      ) {
+        startCalls.push({ sessionId: sid, options })
+        return originalStartSession(sid, workDir, sdkUrl, options)
+      }) as typeof conversationService.startSession
+
+      const ws = new WebSocket(`${wsUrl}/ws/${sessionId}`)
+      let switchTriggered = false
+      let turnComplete = false
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            ws.close()
+            reject(new Error(`Timed out waiting for active-turn permission switch for session ${sessionId}`))
+          }, 10_000)
+
+          ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data as string)
+
+            if (msg.type === 'connected') {
+              ws.send(JSON.stringify({ type: 'user_message', content: 'active turn permission switch' }))
+              return
+            }
+
+            if (msg.type === 'error') {
+              clearTimeout(timeout)
+              ws.close()
+              reject(new Error(msg.message))
+              return
+            }
+
+            if (
+              msg.type === 'content_delta' &&
+              typeof msg.text === 'string' &&
+              msg.text.includes('active turn permission switch') &&
+              !switchTriggered
+            ) {
+              switchTriggered = true
+              ws.send(JSON.stringify({
+                type: 'set_permission_mode',
+                mode: 'bypassPermissions',
+              }))
+              return
+            }
+
+            if (
+              msg.type === 'status' &&
+              msg.state === 'idle' &&
+              switchTriggered &&
+              !turnComplete &&
+              startCalls.length > 1
+            ) {
+              clearTimeout(timeout)
+              ws.close()
+              reject(new Error('Permission restart ran before the active turn completed'))
+              return
+            }
+
+            if (msg.type === 'message_complete' && switchTriggered && !turnComplete) {
+              turnComplete = true
+              expect(startCalls).toHaveLength(1)
+              return
+            }
+
+            if (msg.type === 'status' && msg.state === 'idle' && turnComplete && startCalls.length > 1) {
+              clearTimeout(timeout)
+              ws.close()
+              resolve()
+            }
+          }
+
+          ws.onerror = () => {
+            clearTimeout(timeout)
+            reject(new Error(`WebSocket error for active-turn permission switch session ${sessionId}`))
+          }
+        })
+
+        expect(switchTriggered).toBe(true)
+        expect(turnComplete).toBe(true)
+        expect(startCalls).toHaveLength(2)
+        expect(startCalls[0]).toMatchObject({
+          sessionId,
+          options: {
+            permissionMode: 'default',
+          },
+        })
+        expect(startCalls[1]).toMatchObject({
+          sessionId,
+          options: {
+            permissionMode: 'bypassPermissions',
+          },
+        })
+      } finally {
+        ws.close()
+        conversationService.startSession = originalStartSession
+        conversationService.stopSession(sessionId)
+        await fetch(`${baseUrl}/api/permissions/mode`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: 'default' }),
+        })
+      }
+    })
+  }, 20_000)
+
   it('should keep the session idle in the UI while restarting for a bypass permission switch', async () => {
     await fetch(`${baseUrl}/api/permissions/mode`, {
       method: 'PUT',
@@ -2544,7 +3356,7 @@ describe('WebSocket Chat Integration', () => {
     }
   }, 20_000)
 
-  it('should restart when switching from bypass permissions back to default', async () => {
+  it('should switch from bypass permissions back to default without restarting', async () => {
     const createRes = await fetch(`${baseUrl}/api/sessions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2612,24 +3424,14 @@ describe('WebSocket Chat Integration', () => {
         mode: 'default',
       }))
 
-      await waitUntil(
-        async () => messages.slice(switchStartIndex).some((msg) => msg.type === 'status' && msg.state === 'idle'),
-        `bypass-to-default permission switch completion for ${sessionId}`,
-      )
-
-      expect(startCalls).toHaveLength(2)
-      expect(startCalls[1]).toMatchObject({
-        sessionId,
-        options: {
-          permissionMode: 'default',
-        },
-      })
       await waitUntil(async () => {
         const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/inspection?includeContext=0`)
         if (!res.ok) return false
         const body = await res.json() as { status?: { permissionMode?: string } }
         return body.status?.permissionMode === 'default'
       }, `persisted bypass-to-default permission switch for ${sessionId}`)
+      expect(startCalls).toHaveLength(1)
+      expect(conversationService.getSessionPermissionMode(sessionId)).toBe('default')
       expect(messages.slice(switchStartIndex).some((msg) => msg.type === 'error')).toBe(false)
     } finally {
       ws.close()
