@@ -116,7 +116,7 @@ function buildProviderChoices(
 
   const choices: ProviderChoice[] = []
 
-  if (claudeOfficialLoggedIn) {
+  if (claudeOfficialLoggedIn && claudeOfficialModels.length > 0) {
     choices.push(officialChoices(null, claudeOfficialModels, activeId === null, officialName))
   }
   if (openAIOfficialLoggedIn) {

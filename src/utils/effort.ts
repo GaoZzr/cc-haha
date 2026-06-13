@@ -6,6 +6,7 @@ import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/grow
 import { getAPIProvider, isFirstPartyAnthropicBaseUrl } from './model/providers.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { isEnvTruthy } from './envUtils.js'
+import { isOpenAIResponsesModel } from 'src/services/openaiAuth/models.js'
 import type { EffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
 
 export type { EffortLevel }
@@ -54,6 +55,9 @@ export function modelSupportsMaxEffort(model: string): boolean {
   const supported3P = get3PModelCapabilityOverride(model, 'max_effort')
   if (supported3P !== undefined) {
     return supported3P
+  }
+  if (isOpenAIResponsesModel(model)) {
+    return true
   }
   if (model.toLowerCase().includes('opus-4-6')) {
     return true

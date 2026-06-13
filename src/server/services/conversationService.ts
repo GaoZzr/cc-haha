@@ -478,6 +478,13 @@ export class ConversationService {
     return sent
   }
 
+  updateSessionPermissionMode(sessionId: string, mode: string): void {
+    const session = this.sessions.get(sessionId)
+    if (session) {
+      session.permissionMode = mode
+    }
+  }
+
   setMaxThinkingTokens(sessionId: string, maxThinkingTokens: number | null): boolean {
     return this.sendSdkMessage(sessionId, {
       type: 'control_request',

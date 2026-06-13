@@ -20,6 +20,12 @@ export type ModelMapping = {
 
 export type ModelContextWindows = Record<string, number>
 
+export type VisionRouter = {
+  enabled?: boolean
+  providerId: string
+  trigger?: 'image'
+}
+
 export type SavedProvider = {
   id: string
   presetId: string
@@ -32,6 +38,7 @@ export type SavedProvider = {
   models: ModelMapping
   autoCompactWindow?: number
   modelContextWindows?: ModelContextWindows
+  visionRouter?: VisionRouter
   notes?: string
 }
 
@@ -46,6 +53,7 @@ export type CreateProviderInput = {
   models: ModelMapping
   autoCompactWindow?: number
   modelContextWindows?: ModelContextWindows
+  visionRouter?: VisionRouter
   notes?: string
 }
 
@@ -59,6 +67,7 @@ export type UpdateProviderInput = {
   models?: ModelMapping
   autoCompactWindow?: number | null
   modelContextWindows?: ModelContextWindows | null
+  visionRouter?: VisionRouter | null
   notes?: string
 }
 

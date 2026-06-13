@@ -130,4 +130,47 @@ describe('buildOpenAICodexFetch', () => {
       content: [{ type: 'text', text: 'streamed ok' }],
     })
   })
+
+  test('maps Claude max effort to OpenAI xhigh reasoning effort', async () => {
+    const upstreamCalls: Array<{
+      body: Record<string, unknown>
+    }> = []
+    const fetchOverride: typeof fetch = async (_input, init) => {
+      upstreamCalls.push({
+        body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+      })
+      return Response.json({
+        id: 'resp_effort',
+        object: 'response',
+        created_at: 1_779_118_000,
+        model: 'gpt-5.5',
+        status: 'completed',
+        output: [{
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'ok' }],
+        }],
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      })
+    }
+
+    const openAIFetch = buildOpenAICodexFetch(fetchOverride, 'test')
+    for (const effort of ['medium', 'high', 'max'] as const) {
+      await openAIFetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'gpt-5.5',
+          max_tokens: 64,
+          messages: [{ role: 'user', content: `Say ok with ${effort}` }],
+          output_config: { effort },
+        }),
+      })
+    }
+
+    expect(upstreamCalls.map(call => call.body.reasoning)).toEqual([
+      { effort: 'medium' },
+      { effort: 'high' },
+      { effort: 'xhigh' },
+    ])
+  })
 })

@@ -136,8 +136,15 @@ export function getPresetAuthStrategy(presetId: string): ProviderAuthStrategy {
   return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.authStrategy ?? 'auth_token'
 }
 
-function getPresetModelContextWindows(presetId: string): Record<string, number> {
+export function getPresetModelContextWindows(presetId: string): Record<string, number> {
   return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.modelContextWindows ?? {}
+}
+
+export function getProviderModelContextWindows(provider: SavedProvider): Record<string, number> {
+  return {
+    ...getPresetModelContextWindows(provider.presetId),
+    ...(provider.modelContextWindows ?? {}),
+  }
 }
 
 export function buildProviderAuthEnv(
@@ -188,17 +195,16 @@ export function buildProviderManagedEnv(
 
   const apiFormat: ApiFormat = provider.apiFormat ?? 'anthropic'
   const needsProxy = apiFormat !== 'anthropic'
+  const visionRouterEnabled = provider.visionRouter && provider.visionRouter.enabled !== false
+  const routesThroughProxy = needsProxy || !!visionRouterEnabled
   const proxyPath = options?.proxyPath ?? '/proxy'
   const serverPort = options?.serverPort ?? 3456
-  const baseUrl = needsProxy
+  const baseUrl = routesThroughProxy
     ? `http://127.0.0.1:${serverPort}${proxyPath}`
     : provider.baseUrl
 
   const models = normalizeModelMapping(provider.models)
-  const modelContextWindows = {
-    ...getPresetModelContextWindows(provider.presetId),
-    ...(provider.modelContextWindows ?? {}),
-  }
+  const modelContextWindows = getProviderModelContextWindows(provider)
 
   const presetDefaultEnv = getPresetDefaultEnv(provider.presetId)
   const customProviderCapabilityEnv =
@@ -220,7 +226,7 @@ export function buildProviderManagedEnv(
       [MODEL_CONTEXT_WINDOWS_ENV_KEY]: JSON.stringify(modelContextWindows),
     }),
     ANTHROPIC_BASE_URL: baseUrl,
-    ...buildProviderAuthEnv(provider, presetDefaultEnv, needsProxy),
+    ...buildProviderAuthEnv(provider, presetDefaultEnv, routesThroughProxy),
     ANTHROPIC_MODEL: models.main,
     ANTHROPIC_DEFAULT_HAIKU_MODEL: models.haiku,
     ANTHROPIC_DEFAULT_SONNET_MODEL: models.sonnet,

@@ -9,24 +9,24 @@ export const OPENAI_OFFICIAL_MODELS: ModelInfo[] = [
     id: OPENAI_OFFICIAL_DEFAULT_MODEL_ID,
     name: 'GPT-5.3 Codex',
     description: 'Best for coding and agentic work',
-    context: '',
+    context: '258k',
   },
   {
     id: 'gpt-5.4',
     name: 'GPT-5.4',
     description: 'Strong general-purpose model',
-    context: '',
+    context: '950k',
   },
   {
     id: 'gpt-5.5',
     name: 'GPT-5.5',
     description: 'Latest general-purpose model',
-    context: '',
+    context: '258k',
   },
   {
     id: 'gpt-5.4-mini',
     name: 'GPT-5.4 Mini',
     description: 'Fastest for quick tasks',
-    context: '',
+    context: '258k',
   },
 ]

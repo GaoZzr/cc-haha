@@ -162,11 +162,18 @@ function convertUserMessage(
         : Array.isArray(block.content)
           ? block.content.filter((b): b is Extract<AnthropicContentBlock, { type: 'text' }> => b.type === 'text').map((b) => b.text).join('\n')
           : ''
+      const resultImages = Array.isArray(block.content)
+        ? block.content.filter((b): b is Extract<AnthropicContentBlock, { type: 'image' }> => b.type === 'image')
+        : []
       output.push({
         role: 'tool',
         tool_call_id: block.tool_use_id,
-        content: resultContent,
+        content: resultContent || (resultImages.length > 0 ? '[image output]' : ''),
       })
+      for (const image of resultImages) {
+        const url = `data:${image.source.media_type};base64,${image.source.data}`
+        contentParts.push({ type: 'image_url', image_url: { url } })
+      }
     }
   }
 

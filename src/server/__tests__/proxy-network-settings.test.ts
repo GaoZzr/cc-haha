@@ -270,4 +270,271 @@ describe('proxy network settings', () => {
       globalThis.fetch = originalFetch
     }
   })
+
+  test('routes image requests from a native text provider to its configured vision provider', async () => {
+    const svc = new ProviderService()
+    const visionProvider = await svc.addProvider({
+      presetId: 'custom',
+      name: 'MiMo Vision',
+      baseUrl: 'https://vision.example.com',
+      apiKey: 'sk-vision',
+      apiFormat: 'openai_chat',
+      models: {
+        main: 'mimo-v2.5',
+        haiku: 'mimo-v2.5',
+        sonnet: 'mimo-v2.5',
+        opus: 'mimo-v2.5',
+      },
+    })
+    const textProvider = await svc.addProvider({
+      presetId: 'custom',
+      name: 'MiMo Text',
+      baseUrl: 'https://text.example.com/anthropic',
+      apiKey: 'sk-text',
+      authStrategy: 'auth_token',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'mimo-v2.5-pro',
+        haiku: 'mimo-v2.5-pro',
+        sonnet: 'mimo-v2.5-pro',
+        opus: 'mimo-v2.5-pro',
+      },
+      visionRouter: {
+        providerId: visionProvider.id,
+      },
+    })
+    await svc.activateProvider(textProvider.id)
+
+    const originalFetch = globalThis.fetch
+    let upstreamUrl = ''
+    let upstreamBody: Record<string, unknown> = {}
+    globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+      upstreamUrl = String(url)
+      upstreamBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+      return new Response(JSON.stringify({
+        id: 'chatcmpl-vision',
+        object: 'chat.completion',
+        created: 0,
+        model: 'mimo-v2.5',
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: 'vision ok' },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      const body = {
+        model: 'mimo-v2.5-pro',
+        max_tokens: 64,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Describe this image.' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc123' } },
+          ],
+        }],
+      }
+      const req = new Request('http://localhost:3456/proxy/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+
+      const res = await handleProxyRequest(req, new URL(req.url))
+      const json = await res.json() as Record<string, unknown>
+      const messages = upstreamBody.messages as Array<{
+        role: string
+        content: string | Array<{ type: string; image_url?: { url: string } }>
+      }>
+      const userMessage = messages.find((message) => message.role === 'user')
+      const userContent = userMessage?.content as Array<{ type: string; image_url?: { url: string } }>
+
+      expect(res.status).toBe(200)
+      expect(upstreamUrl).toBe('https://vision.example.com/v1/chat/completions')
+      expect(upstreamBody.model).toBe('mimo-v2.5')
+      expect(userContent[1].type).toBe('image_url')
+      expect(userContent[1].image_url?.url).toBe('data:image/png;base64,abc123')
+      expect(json.model).toBe('mimo-v2.5')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('routes image requests from a provider-scoped runtime path to its configured vision provider', async () => {
+    const svc = new ProviderService()
+    const visionProvider = await svc.addProvider({
+      presetId: 'custom',
+      name: 'MiMo Vision',
+      baseUrl: 'https://vision.example.com',
+      apiKey: 'sk-vision',
+      apiFormat: 'openai_chat',
+      models: {
+        main: 'mimo-v2.5',
+        haiku: 'mimo-v2.5',
+        sonnet: 'mimo-v2.5',
+        opus: 'mimo-v2.5',
+      },
+    })
+    const textProvider = await svc.addProvider({
+      presetId: 'custom',
+      name: 'MiMo Text',
+      baseUrl: 'https://text.example.com/anthropic',
+      apiKey: 'sk-text',
+      authStrategy: 'auth_token',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'mimo-v2.5-pro',
+        haiku: 'mimo-v2.5-pro',
+        sonnet: 'mimo-v2.5-pro',
+        opus: 'mimo-v2.5-pro',
+      },
+      visionRouter: {
+        providerId: visionProvider.id,
+      },
+    })
+
+    const originalFetch = globalThis.fetch
+    let upstreamUrl = ''
+    let upstreamBody: Record<string, unknown> = {}
+    globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+      upstreamUrl = String(url)
+      upstreamBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+      return new Response(JSON.stringify({
+        id: 'chatcmpl-provider-scoped-vision',
+        object: 'chat.completion',
+        created: 0,
+        model: 'mimo-v2.5',
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: 'vision ok' },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      const body = {
+        model: 'mimo-v2.5-pro',
+        max_tokens: 64,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Describe this image.' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc123' } },
+          ],
+        }],
+      }
+      const req = new Request(
+        `http://localhost:3456/proxy/providers/${textProvider.id}/v1/messages`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+      )
+
+      const res = await handleProxyRequest(req, new URL(req.url))
+      const json = await res.json() as Record<string, unknown>
+
+      expect(res.status).toBe(200)
+      expect(upstreamUrl).toBe('https://vision.example.com/v1/chat/completions')
+      expect(upstreamBody.model).toBe('mimo-v2.5')
+      expect(json.model).toBe('mimo-v2.5')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('passes text-only requests from a native provider through without using the vision provider', async () => {
+    const svc = new ProviderService()
+    const visionProvider = await svc.addProvider({
+      presetId: 'custom',
+      name: 'MiMo Vision',
+      baseUrl: 'https://vision.example.com',
+      apiKey: 'sk-vision',
+      apiFormat: 'openai_chat',
+      models: {
+        main: 'mimo-v2.5',
+        haiku: 'mimo-v2.5',
+        sonnet: 'mimo-v2.5',
+        opus: 'mimo-v2.5',
+      },
+    })
+    const textProvider = await svc.addProvider({
+      presetId: 'custom',
+      name: 'MiMo Text',
+      baseUrl: 'https://text.example.com/anthropic',
+      apiKey: 'sk-text',
+      authStrategy: 'auth_token',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'mimo-v2.5-pro',
+        haiku: 'mimo-v2.5-pro',
+        sonnet: 'mimo-v2.5-pro',
+        opus: 'mimo-v2.5-pro',
+      },
+      visionRouter: {
+        providerId: visionProvider.id,
+      },
+    })
+    await svc.activateProvider(textProvider.id)
+
+    const originalFetch = globalThis.fetch
+    let upstreamUrl = ''
+    let upstreamBody: Record<string, unknown> = {}
+    let authorization = ''
+    globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+      upstreamUrl = String(url)
+      upstreamBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+      const headers = init?.headers as Record<string, string>
+      authorization = headers.Authorization ?? ''
+      return new Response(JSON.stringify({
+        id: 'msg-text',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'text ok' }],
+        model: 'mimo-v2.5-pro',
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      const body = {
+        model: 'mimo-v2.5-pro',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'hello' }],
+      }
+      const req = new Request('http://localhost:3456/proxy/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+
+      const res = await handleProxyRequest(req, new URL(req.url))
+      const json = await res.json() as Record<string, unknown>
+
+      expect(res.status).toBe(200)
+      expect(upstreamUrl).toBe('https://text.example.com/anthropic/v1/messages')
+      expect(upstreamBody.model).toBe('mimo-v2.5-pro')
+      expect(authorization).toBe('Bearer sk-text')
+      expect(json.model).toBe('mimo-v2.5-pro')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
 })

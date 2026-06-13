@@ -41,6 +41,7 @@ import {
   loadNetworkSettings,
   type NetworkSettings,
 } from './networkSettings.js'
+import { getProviderUserAgent } from './providerUserAgent.js'
 import type {
   SavedProvider,
   ProvidersIndex,
@@ -155,6 +156,7 @@ export class ProviderService {
       models: normalizeModelMapping(input.models),
       ...(input.autoCompactWindow !== undefined && { autoCompactWindow: input.autoCompactWindow }),
       ...(input.modelContextWindows !== undefined && { modelContextWindows: input.modelContextWindows }),
+      ...(input.visionRouter !== undefined && { visionRouter: input.visionRouter }),
       ...(input.notes !== undefined && { notes: input.notes }),
     }
 
@@ -180,6 +182,7 @@ export class ProviderService {
       ...(input.models !== undefined && { models: normalizeModelMapping(input.models) }),
       ...(typeof input.autoCompactWindow === 'number' && { autoCompactWindow: input.autoCompactWindow }),
       ...(input.modelContextWindows !== undefined && input.modelContextWindows !== null && { modelContextWindows: input.modelContextWindows }),
+      ...(input.visionRouter !== undefined && input.visionRouter !== null && { visionRouter: input.visionRouter }),
       ...(input.notes !== undefined && { notes: input.notes }),
     }
     if (input.autoCompactWindow === null) {
@@ -187,6 +190,9 @@ export class ProviderService {
     }
     if (input.modelContextWindows === null) {
       delete updated.modelContextWindows
+    }
+    if (input.visionRouter === null) {
+      delete updated.visionRouter
     }
 
     index.providers[idx] = updated
@@ -374,9 +380,14 @@ export class ProviderService {
   // --- Proxy support ---
 
   async getProviderForProxy(providerId?: string): Promise<{
+    id: string
+    name: string
     baseUrl: string
     apiKey: string
     apiFormat: ApiFormat
+    authStrategy?: ProviderAuthStrategy
+    models: SavedProvider['models']
+    visionRouter?: SavedProvider['visionRouter']
   } | null> {
     if (providerId) {
       if (isOpenAIOfficialProviderId(providerId)) {
@@ -384,9 +395,14 @@ export class ProviderService {
       }
       const provider = await this.getProvider(providerId)
       return {
+        id: provider.id,
+        name: provider.name,
         baseUrl: provider.baseUrl,
         apiKey: provider.apiKey,
         apiFormat: provider.apiFormat ?? 'anthropic',
+        authStrategy: provider.authStrategy ?? getPresetAuthStrategy(provider.presetId),
+        models: provider.models,
+        visionRouter: provider.visionRouter,
       }
     }
 
@@ -398,16 +414,26 @@ export class ProviderService {
     const provider = await this.getProvider(index.activeId).catch(() => null)
     if (!provider) return null
     return {
+      id: provider.id,
+      name: provider.name,
       baseUrl: provider.baseUrl,
       apiKey: provider.apiKey,
       apiFormat: provider.apiFormat ?? 'anthropic',
+      authStrategy: provider.authStrategy ?? getPresetAuthStrategy(provider.presetId),
+      models: provider.models,
+      visionRouter: provider.visionRouter,
     }
   }
 
   async getActiveProviderForProxy(): Promise<{
+    id: string
+    name: string
     baseUrl: string
     apiKey: string
     apiFormat: ApiFormat
+    authStrategy?: ProviderAuthStrategy
+    models: SavedProvider['models']
+    visionRouter?: SavedProvider['visionRouter']
   } | null> {
     return this.getProviderForProxy()
   }
@@ -483,7 +509,10 @@ export class ProviderService {
       const proxyOptions = getProxyFetchOptions({ proxyUrl: getManualNetworkProxyUrl(networkSettings) })
       const response = await fetch(url, {
         method: 'POST',
-        headers,
+        headers: {
+          ...headers,
+          'User-Agent': getProviderUserAgent(format),
+        },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(networkSettings.aiRequestTimeoutMs),
         ...proxyOptions,
@@ -548,7 +577,11 @@ export class ProviderService {
       // Call upstream with transformed request
       const response = await fetch(upstreamUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+          'User-Agent': getProviderUserAgent(format),
+        },
         body: JSON.stringify(transformedBody),
         signal: AbortSignal.timeout(networkSettings.aiRequestTimeoutMs),
         ...proxyOptions,

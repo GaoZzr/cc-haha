@@ -13,39 +13,24 @@ import { ProviderService } from '../services/providerService.js'
 import { attributionHeaderEnvForModel } from '../services/attributionHeaderPolicy.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
 import { hasOpenAIAuthLogin } from '../../utils/auth.js'
-import { OPENAI_CODEX_MODEL_CATALOG } from '../../services/openaiAuth/models.js'
+import {
+  OPENAI_CODEX_MODEL_CATALOG,
+  getOpenAICodexContextWindowForModel,
+} from '../../services/openaiAuth/models.js'
 import {
   OPENAI_OFFICIAL_PROVIDER_ID,
   OPENAI_OFFICIAL_PROVIDER_NAME,
   isOpenAIOfficialProviderId,
 } from '../services/openaiOfficialProvider.js'
+import { getProviderModelContextWindows } from '../services/providerRuntimeEnv.js'
 
 // ─── Fallback models (used when no provider is configured) ────────────────────
 
-const DEFAULT_MODELS = [
-  {
-    id: 'claude-opus-4-7',
-    name: 'Opus 4.7',
-    description: 'Most capable for ambitious work',
-    context: '1m',
-  },
-  {
-    id: 'claude-sonnet-4-6',
-    name: 'Sonnet 4.6',
-    description: 'Most efficient for everyday tasks',
-    context: '200k',
-  },
-  {
-    id: 'claude-haiku-4-5',
-    name: 'Haiku 4.5',
-    description: 'Fastest for quick answers',
-    context: '200k',
-  },
-] as const
+const DEFAULT_MODELS: ApiModelInfo[] = []
 
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'max'] as const
 
-const DEFAULT_MODEL = 'claude-opus-4-7'
+const DEFAULT_MODEL = 'gpt-5.5'
 const DEFAULT_EFFORT = 'max'
 
 const settingsService = new SettingsService()
@@ -73,26 +58,45 @@ function addUniqueModel(
   models.push(model)
 }
 
+function formatContextWindow(tokens: number | undefined): string {
+  if (!tokens || !Number.isFinite(tokens) || tokens <= 0) {
+    return ''
+  }
+
+  if (tokens >= 1_000_000) {
+    const millions = tokens / 1_000_000
+    return Number.isInteger(millions)
+      ? `${millions}m`
+      : `${Math.round(tokens / 1_000)}k`
+  }
+
+  if (tokens % 1024 === 0) {
+    return `${Math.round(tokens / 1024)}k`
+  }
+
+  return `${Math.round(tokens / 1_000)}k`
+}
+
 function buildProviderModelList(models: {
   main: string
   haiku: string
   sonnet: string
   opus: string
-}): ApiModelInfo[] {
+}, modelContextWindows: Record<string, number> = {}): ApiModelInfo[] {
   const modelList: ApiModelInfo[] = []
 
   addUniqueModel(modelList, {
     id: models.main,
     name: models.main,
     description: 'Main model',
-    context: '',
+    context: formatContextWindow(modelContextWindows[models.main]),
   })
   addUniqueModel(modelList, models.haiku
     ? {
         id: models.haiku,
         name: models.haiku,
         description: 'Haiku model',
-        context: '',
+        context: formatContextWindow(modelContextWindows[models.haiku]),
       }
     : null)
   addUniqueModel(modelList, models.sonnet
@@ -100,7 +104,7 @@ function buildProviderModelList(models: {
         id: models.sonnet,
         name: models.sonnet,
         description: 'Sonnet model',
-        context: '',
+        context: formatContextWindow(modelContextWindows[models.sonnet]),
       }
     : null)
   addUniqueModel(modelList, models.opus
@@ -108,7 +112,7 @@ function buildProviderModelList(models: {
         id: models.opus,
         name: models.opus,
         description: 'Opus model',
-        context: '',
+        context: formatContextWindow(modelContextWindows[models.opus]),
       }
     : null)
 
@@ -120,7 +124,9 @@ function buildOpenAIModelList(): ApiModelInfo[] {
     id: model.value,
     name: model.label,
     description: model.description,
-    context: '',
+    context: formatContextWindow(
+      getOpenAICodexContextWindowForModel(model.value) ?? undefined,
+    ),
   }))
 }
 
@@ -211,7 +217,10 @@ async function handleModelsList(): Promise<Response> {
 
   const activeProvider = activeId ? providers.find((p) => p.id === activeId) : null
   if (activeProvider) {
-    const modelList = buildProviderModelList(activeProvider.models)
+    const modelList = buildProviderModelList(
+      activeProvider.models,
+      getProviderModelContextWindows(activeProvider),
+    )
     return Response.json({
       models: modelList,
       provider: { id: activeProvider.id, name: activeProvider.name },
@@ -264,7 +273,10 @@ async function handleCurrentModel(req: Request): Promise<Response> {
     const availableModels = isOpenAIProviderActive
       ? buildOpenAIModelList()
       : activeProvider
-        ? buildProviderModelList(activeProvider.models)
+        ? buildProviderModelList(
+            activeProvider.models,
+            getProviderModelContextWindows(activeProvider),
+          )
         : getStandaloneModelList()
 
     const modelEntry = availableModels.find((m) => m.id === lookupId)

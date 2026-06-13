@@ -42,6 +42,12 @@ export const ModelContextWindowsSchema = z.record(
   z.number().int().min(16000).max(10000000),
 )
 
+export const VisionRouterSchema = z.object({
+  enabled: z.boolean().optional(),
+  providerId: z.string().min(1),
+  trigger: z.literal('image').optional(),
+})
+
 export const SavedProviderSchema = z.object({
   id: z.string(),
   presetId: z.string(),
@@ -54,6 +60,7 @@ export const SavedProviderSchema = z.object({
   models: ModelMappingSchema,
   autoCompactWindow: AutoCompactWindowSchema.optional(),
   modelContextWindows: ModelContextWindowsSchema.optional(),
+  visionRouter: VisionRouterSchema.optional(),
   notes: z.string().optional(),
 })
 
@@ -74,6 +81,7 @@ export const CreateProviderSchema = z.object({
   models: ModelMappingSchema,
   autoCompactWindow: AutoCompactWindowSchema.optional(),
   modelContextWindows: ModelContextWindowsSchema.optional(),
+  visionRouter: VisionRouterSchema.optional(),
   notes: z.string().optional(),
 })
 
@@ -87,6 +95,7 @@ export const UpdateProviderSchema = z.object({
   models: ModelMappingSchema.optional(),
   autoCompactWindow: AutoCompactWindowSchema.nullable().optional(),
   modelContextWindows: ModelContextWindowsSchema.nullable().optional(),
+  visionRouter: VisionRouterSchema.nullable().optional(),
   notes: z.string().optional(),
 })
 

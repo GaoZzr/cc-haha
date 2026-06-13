@@ -11,12 +11,13 @@ const targetTriple =
   (await detectHostTriple())
 
 const bunTarget = mapTargetTripleToBun(targetTriple)
+const bunExecutable = process.execPath
 
 // 编译前先扫一遍 src/ 把所有缺失的 ant-internal 模块在磁盘上 stub 出来。
 // 见 desktop/scripts/scan-missing-imports.ts。
 console.log('[build-sidecars] scanning for missing imports...')
 const scanProc = Bun.spawn(
-  ['bun', 'run', path.join(desktopRoot, 'scripts/scan-missing-imports.ts')],
+  [bunExecutable, 'run', path.join(desktopRoot, 'scripts/scan-missing-imports.ts')],
   { cwd: repoRoot, stdout: 'inherit', stderr: 'inherit' },
 )
 const scanExit = await scanProc.exited

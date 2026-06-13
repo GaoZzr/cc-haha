@@ -102,4 +102,56 @@ describe('providerRuntimeEnv', () => {
       DISABLE_AUTOUPDATER: '1',
     })
   })
+
+  test('routes native providers through the local proxy when a vision router is enabled', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'text-provider',
+      providers: [
+        {
+          id: 'text-provider',
+          presetId: 'custom',
+          name: 'MiMo Text',
+          apiKey: 'sk-text',
+          authStrategy: 'auth_token',
+          baseUrl: 'https://text.example.com/anthropic',
+          apiFormat: 'anthropic',
+          models: {
+            main: 'mimo-v2.5-pro',
+            haiku: 'mimo-v2.5-pro',
+            sonnet: 'mimo-v2.5-pro',
+            opus: 'mimo-v2.5-pro',
+          },
+          visionRouter: {
+            providerId: 'vision-provider',
+          },
+        },
+        {
+          id: 'vision-provider',
+          presetId: 'custom',
+          name: 'MiMo Vision',
+          apiKey: 'sk-vision',
+          baseUrl: 'https://vision.example.com',
+          apiFormat: 'openai_chat',
+          models: {
+            main: 'mimo-v2.5',
+            haiku: 'mimo-v2.5',
+            sonnet: 'mimo-v2.5',
+            opus: 'mimo-v2.5',
+          },
+        },
+      ],
+    })
+
+    const env = readActiveProviderManagedEnv(tmpDir, { serverPort: 4567 })
+
+    expect(env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:4567/proxy',
+      ANTHROPIC_API_KEY: 'proxy-managed',
+      ANTHROPIC_MODEL: 'mimo-v2.5-pro',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'mimo-v2.5-pro',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'mimo-v2.5-pro',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'mimo-v2.5-pro',
+    })
+    expect(env?.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+  })
 })

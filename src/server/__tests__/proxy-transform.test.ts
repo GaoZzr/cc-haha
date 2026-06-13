@@ -216,6 +216,34 @@ describe('anthropicToOpenaiChat', () => {
     expect(result.messages[0].content).toBe('Sunny, 72°F')
   })
 
+  test('tool_result with image keeps image visible to chat models', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-4',
+      max_tokens: 100,
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'tc_img',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc123' } },
+          ],
+        }],
+      }],
+    }
+    const result = anthropicToOpenaiChat(req)
+    expect(result.messages[0]).toEqual({
+      role: 'tool',
+      tool_call_id: 'tc_img',
+      content: '[image output]',
+    })
+    const imageMsg = result.messages[1]
+    expect(imageMsg.role).toBe('user')
+    const content = imageMsg.content as Array<{ type: string; image_url?: { url: string } }>
+    expect(content[0].type).toBe('image_url')
+    expect(content[0].image_url!.url).toBe('data:image/png;base64,abc123')
+  })
+
   test('image content conversion', () => {
     const req: AnthropicRequest = {
       model: 'gpt-4',
@@ -402,6 +430,19 @@ describe('anthropicToOpenaiResponses', () => {
     expect(result.input).toEqual([{ type: 'message', role: 'user', content: 'Hello' }])
   })
 
+  test('drops sampling params for Responses models', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-5.5',
+      max_tokens: 1024,
+      temperature: 0,
+      top_p: 0.9,
+      messages: [{ role: 'user', content: 'Hello' }],
+    }
+    const result = anthropicToOpenaiResponses(req) as Record<string, unknown>
+    expect(result.temperature).toBeUndefined()
+    expect(result.top_p).toBeUndefined()
+  })
+
   test('tools conversion uses top-level name', () => {
     const req: AnthropicRequest = {
       model: 'gpt-4o',
@@ -473,6 +514,85 @@ describe('anthropicToOpenaiResponses', () => {
     }
     const result = anthropicToOpenaiResponses(req)
     expect(result.reasoning).toEqual({ effort: 'high' })
+  })
+
+  test('output_config effort maps to Responses reasoning effort', () => {
+    const baseReq: AnthropicRequest = {
+      model: 'gpt-5.5',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'Hi' }],
+    }
+
+    expect(anthropicToOpenaiResponses({
+      ...baseReq,
+      output_config: { effort: 'medium' },
+    }).reasoning).toEqual({ effort: 'medium' })
+
+    expect(anthropicToOpenaiResponses({
+      ...baseReq,
+      output_config: { effort: 'high' },
+    }).reasoning).toEqual({ effort: 'high' })
+
+    expect(anthropicToOpenaiResponses({
+      ...baseReq,
+      output_config: { effort: 'max' },
+    }).reasoning).toEqual({ effort: 'xhigh' })
+  })
+
+  test('tool_result with image keeps image visible to responses models', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-4o',
+      max_tokens: 100,
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'tc_img',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc123' } },
+          ],
+        }],
+      }],
+    }
+    const result = anthropicToOpenaiResponses(req)
+    expect(result.input[0]).toEqual({
+      type: 'function_call_output',
+      call_id: 'tc_img',
+      output: '[image output]',
+    })
+    const imageItem = result.input[1]
+    expect(imageItem.type).toBe('message')
+    if (imageItem.type === 'message') {
+      expect(imageItem.role).toBe('user')
+      const content = imageItem.content as Array<{ type: string; text?: string; image_url?: string }>
+      expect(content[0].type).toBe('input_text')
+      expect(content[1].type).toBe('input_image')
+      expect(content[1].image_url).toBe('data:image/png;base64,abc123')
+    }
+  })
+
+  test('image message uses Responses input image parts', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-4o',
+      max_tokens: 100,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'What is this?' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc123' } },
+        ],
+      }],
+    }
+    const result = anthropicToOpenaiResponses(req)
+    const item = result.input[0]
+    expect(item.type).toBe('message')
+    if (item.type === 'message') {
+      const content = item.content as Array<{ type: string; text?: string; image_url?: string }>
+      expect(content).toEqual([
+        { type: 'input_text', text: 'What is this?' },
+        { type: 'input_image', image_url: 'data:image/png;base64,abc123' },
+      ])
+    }
   })
 
   test('stop_sequences dropped', () => {

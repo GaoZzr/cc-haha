@@ -10,7 +10,7 @@ import type {
   AnthropicMessage,
   OpenAIResponsesRequest,
   OpenAIResponsesInputItem,
-  OpenAIChatContentPart,
+  OpenAIResponsesContentPart,
 } from './types.js'
 
 /**
@@ -43,9 +43,8 @@ export function anthropicToOpenaiResponses(body: AnthropicRequest): OpenAIRespon
   // max_tokens — omit to let upstream provider use its own default/max.
   // Claude Code sends very large values that exceed many providers' limits.
 
-  // temperature & top_p
-  if (body.temperature !== undefined) result.temperature = body.temperature
-  if (body.top_p !== undefined) result.top_p = body.top_p
+  // GPT/Codex Responses models reject sampling params that the Anthropic SDK
+  // may send for side queries or forked agents.
 
   // tools
   if (body.tools && body.tools.length > 0) {
@@ -65,7 +64,10 @@ export function anthropicToOpenaiResponses(body: AnthropicRequest): OpenAIRespon
   }
 
   // thinking → reasoning
-  if (body.thinking) {
+  const effort = convertEffort(body.output_config?.effort)
+  if (effort) {
+    result.reasoning = { effort }
+  } else if (body.thinking) {
     const budget = body.thinking.budget_tokens
     if (budget !== undefined) {
       if (budget <= 1024) result.reasoning = { effort: 'low' }
@@ -79,6 +81,26 @@ export function anthropicToOpenaiResponses(body: AnthropicRequest): OpenAIRespon
   // stop_sequences not supported in Responses API, dropped
 
   return result
+}
+
+type OpenAIResponsesReasoningEffort = NonNullable<
+  OpenAIResponsesRequest['reasoning']
+>['effort']
+
+function convertEffort(
+  effort: string | null | undefined,
+): OpenAIResponsesReasoningEffort | undefined {
+  switch (effort) {
+    case 'low':
+    case 'medium':
+    case 'high':
+      return effort
+    case 'max':
+    case 'xhigh':
+      return 'xhigh'
+    default:
+      return undefined
+  }
 }
 
 function convertMessageToInputItems(msg: AnthropicMessage, output: OpenAIResponsesInputItem[]): void {
@@ -95,28 +117,17 @@ function convertMessageToInputItems(msg: AnthropicMessage, output: OpenAIRespons
     return
   }
 
-  // Collect text/image parts and handle tool blocks separately
-  const contentParts: (string | OpenAIChatContentPart)[] = []
+  // Collect text/image parts and handle tool blocks separately.
+  const contentParts: ResponsePendingContentPart[] = []
 
   for (const block of content) {
     if (block.type === 'text') {
-      contentParts.push(block.text)
+      contentParts.push({ kind: 'text', text: block.text })
     } else if (block.type === 'image') {
-      contentParts.push({
-        type: 'image_url',
-        image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` },
-      })
+      contentParts.push({ kind: 'image', image: block })
     } else if (block.type === 'tool_use') {
       // Flush any accumulated content first
-      if (contentParts.length > 0) {
-        const flatContent = contentParts.length === 1 && typeof contentParts[0] === 'string'
-          ? contentParts[0]
-          : contentParts.map((p) => typeof p === 'string' ? p : '').join('')
-        if (flatContent) {
-          output.push({ type: 'message', role: msg.role, content: flatContent })
-        }
-        contentParts.length = 0
-      }
+      flushResponseContentParts(msg.role, contentParts, output)
       // Lift to function_call item
       output.push({
         type: 'function_call',
@@ -131,23 +142,79 @@ function convertMessageToInputItems(msg: AnthropicMessage, output: OpenAIRespons
         : Array.isArray(block.content)
           ? block.content.filter((b): b is Extract<AnthropicContentBlock, { type: 'text' }> => b.type === 'text').map((b) => b.text).join('\n')
           : ''
+      const resultImages = Array.isArray(block.content)
+        ? block.content.filter((b): b is Extract<AnthropicContentBlock, { type: 'image' }> => b.type === 'image')
+        : []
       output.push({
         type: 'function_call_output',
         call_id: block.tool_use_id,
-        output: resultContent,
+        output: resultContent || (resultImages.length > 0 ? '[image output]' : ''),
       })
+      if (resultImages.length > 0) {
+        output.push({
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: `Image output from tool call ${block.tool_use_id}.` },
+            ...resultImages.map((image) => toResponsesImagePart(image)),
+          ],
+        })
+      }
     }
     // Skip thinking blocks
   }
 
   // Flush remaining content
-  if (contentParts.length > 0) {
-    const flatContent = contentParts.length === 1 && typeof contentParts[0] === 'string'
-      ? contentParts[0]
-      : contentParts.map((p) => typeof p === 'string' ? p : '').join('')
-    if (flatContent) {
-      output.push({ type: 'message', role: msg.role, content: flatContent })
+  flushResponseContentParts(msg.role, contentParts, output)
+}
+
+type ResponsePendingContentPart =
+  | { kind: 'text'; text: string }
+  | { kind: 'image'; image: Extract<AnthropicContentBlock, { type: 'image' }> }
+
+function flushResponseContentParts(
+  role: AnthropicMessage['role'],
+  parts: ResponsePendingContentPart[],
+  output: OpenAIResponsesInputItem[],
+): void {
+  if (parts.length === 0) return
+
+  const hasImage = parts.some((part) => part.kind === 'image')
+  if (!hasImage) {
+    const text = parts
+      .filter((part): part is Extract<ResponsePendingContentPart, { kind: 'text' }> => part.kind === 'text')
+      .map((part) => part.text)
+      .join('')
+    if (text) {
+      output.push({ type: 'message', role, content: text })
     }
+    parts.length = 0
+    return
+  }
+
+  const content: OpenAIResponsesContentPart[] = []
+  for (const part of parts) {
+    if (part.kind === 'text') {
+      const text = part.text
+      if (text) content.push(role === 'assistant'
+        ? { type: 'output_text', text }
+        : { type: 'input_text', text })
+    } else {
+      content.push(toResponsesImagePart(part.image))
+    }
+  }
+  if (content.length > 0) {
+    output.push({ type: 'message', role, content })
+  }
+  parts.length = 0
+}
+
+function toResponsesImagePart(
+  image: Extract<AnthropicContentBlock, { type: 'image' }>,
+): OpenAIResponsesContentPart {
+  return {
+    type: 'input_image',
+    image_url: `data:${image.source.media_type};base64,${image.source.data}`,
   }
 }
 

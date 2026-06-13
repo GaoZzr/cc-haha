@@ -521,6 +521,39 @@ describe('Models API', () => {
     expect(ids.filter((id: string) => id === 'deepseek-v4-pro')).toHaveLength(1)
   })
 
+  it('GET /api/models should expose provider model context windows', async () => {
+    const providerSvc = new ProviderService()
+    const provider = await providerSvc.addProvider({
+      presetId: 'custom',
+      name: 'MiMo',
+      baseUrl: 'https://token-plan-cn.example/anthropic',
+      apiKey: 'test-key',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'mimo-v2.5-pro',
+        haiku: 'mimo-v2.5-pro',
+        sonnet: 'mimo-v2.5-pro',
+        opus: 'mimo-v2.5-pro',
+      },
+      modelContextWindows: {
+        'mimo-v2.5-pro': 1_000_000,
+      },
+    })
+    await providerSvc.activateProvider(provider.id)
+
+    const { req, url, segments } = makeRequest('GET', '/api/models')
+    const res = await handleModelsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.provider.name).toBe('MiMo')
+    expect(body.models).toHaveLength(1)
+    expect(body.models[0]).toMatchObject({
+      id: 'mimo-v2.5-pro',
+      context: '1m',
+    })
+  })
+
   it('GET /api/models/current should return default model when not set', async () => {
     const { req, url, segments } = makeRequest('GET', '/api/models/current')
     const res = await handleModelsApi(req, url, segments)
@@ -635,7 +668,7 @@ describe('Models API', () => {
 
     expect(res.status).toBe(200)
     const body = await res.json() as {
-      models: Array<{ id: string; name: string }>
+      models: Array<{ id: string; name: string; context: string }>
       provider: { id: string; name: string } | null
     }
     expect(body.provider).toEqual({
@@ -647,6 +680,12 @@ describe('Models API', () => {
       'gpt-5.4',
       'gpt-5.5',
       'gpt-5.4-mini',
+    ])
+    expect(body.models.map((model) => [model.id, model.context])).toEqual([
+      ['gpt-5.3-codex', '258k'],
+      ['gpt-5.4', '950k'],
+      ['gpt-5.5', '258k'],
+      ['gpt-5.4-mini', '258k'],
     ])
   })
 
