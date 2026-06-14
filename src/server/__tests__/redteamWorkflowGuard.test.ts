@@ -204,6 +204,15 @@ describe('redteam workflow guard', () => {
     expect(noSpaceResult.run?.target).toBe('https://demo.owasp-juice.shop/')
     expect(noSpaceResult.run?.awaitingGate).toBe(false)
     clearRedteamWorkflowSession('gate-nospace-session')
+
+    const punctuatedResult = prepareRedteamWorkflowPrompt(
+      'gate-punctuation-session',
+      'Authorized full-auto red team test http://127.0.0.1:18888/; markdown report; packet-only evidence; no brute force; no denial of service.',
+      workDir,
+    )
+    expect(punctuatedResult.run?.target).toBe('http://127.0.0.1:18888/')
+    expect(punctuatedResult.run?.awaitingGate).toBe(false)
+    clearRedteamWorkflowSession('gate-punctuation-session')
   })
 
   it('keeps ambiguous partial gate replies pending when manual gate mode is enabled', async () => {
@@ -253,6 +262,12 @@ describe('redteam workflow guard', () => {
     expect(confirmed.content).toContain('redteam-report')
     expect(validation?.ok).toBe(false)
     expect(validation?.errors.join('\n')).toContain('redteam_workflow_state.json')
+
+    const repair = prepareRedteamWorkflowPrompt('confirmed-session', 'continue', workDir)
+    expect(repair.injected).toBe(true)
+    expect(repair.run?.validationRequired).toBe(true)
+    expect(repair.content).toContain('CC_HAHA_REDTEAM_WORKFLOW_CONTRACT')
+    expect(repair.content).toContain('Gate state: confirmed')
 
     clearRedteamWorkflowSession('confirmed-session')
   })
@@ -320,7 +335,7 @@ describe('redteam workflow guard', () => {
       workDir,
     )
     expect(followup.injected).toBe(false)
-    expect(confirmed.run?.coverageProfile).toBe('web_app')
+    expect(confirmed.run?.coverageProfile).toBe('comprehensive')
     expect(confirmed.content).toContain('Coverage oracle bridge')
     expect(confirmed.content).toContain('coverage_oracle.py')
     expect(confirmed.content).toContain('--init-ledgers')

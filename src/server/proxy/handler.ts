@@ -393,13 +393,17 @@ function replaceTextContent(
 
 function extractTargetHint(content: string): string | null {
   const url = content.match(/https?:\/\/[^\s"'<>，。；、？！)）】》\]\u4e00-\u9fff]+/iu)?.[0]
-  if (url) return url.replace(/[.,，。]+$/, '')
+  if (url) return trimTargetHint(url)
 
   const ip = content.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/)?.[0]
   if (ip) return ip
 
   const domain = content.match(/\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\b/i)?.[0]
   return domain ?? null
+}
+
+function trimTargetHint(value: string): string {
+  return value.replace(/[),.;:!?]+$/g, '').replace(/[、。，；：？！）】》]+$/gu, '')
 }
 
 function createAnthropicTextResponse(body: AnthropicRequest, text: string): Response {

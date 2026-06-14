@@ -480,7 +480,7 @@ function looksLikeRedteamRequest(content: string): boolean {
 
 function extractRedteamTarget(content: string): string | null {
   const url = content.match(/https?:\/\/[^\s"'<>，。；、？！)）】》\]\u4e00-\u9fff]+/iu)?.[0]
-  if (url) return url.replace(/[.,，。]+$/, '')
+  if (url) return trimRedteamTarget(url)
 
   const ip = content.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/)?.[0]
   if (ip) return ip
@@ -509,6 +509,10 @@ function isCompleteGateConfirmation(content: string): boolean {
 }
 
 function looksLikeWorkflowRepair(content: string): boolean {
+  const trimmed = content.trim()
+  if (/^(?:continue|go on|ok|yes|next|resume|继续|接着|继续执行|继续测试|继续修复|确认|可以)$/i.test(trimmed)) {
+    return true
+  }
   return /继续.*(红队|报告|ledger|workflow|校验|验证)|修复.*(红队|报告|ledger|workflow|校验|验证)|补.*(报告|ledger|证据|验证)|redteam|red-team|red\s*team/i.test(content)
 }
 
@@ -560,7 +564,11 @@ function inferCoverageProfile(
   if (/ai\s*infra|gpu|k8s|kubernetes|model\s*server|inference|推理服务|模型服务/.test(text)) {
     return 'ai_infra'
   }
-  return fallback ?? 'web_app'
+  return fallback ?? 'comprehensive'
+}
+
+function trimRedteamTarget(value: string): string {
+  return value.replace(/[),.;:!?]+$/g, '').replace(/[、。，；：？！）】》]+$/gu, '')
 }
 
 function sanitizeTarget(target: string): string {
