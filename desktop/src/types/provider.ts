@@ -39,6 +39,7 @@ export type SavedProvider = {
   autoCompactWindow?: number
   modelContextWindows?: ModelContextWindows
   visionRouter?: VisionRouter
+  fallbackProviderId?: string
   notes?: string
 }
 
@@ -54,6 +55,7 @@ export type CreateProviderInput = {
   autoCompactWindow?: number
   modelContextWindows?: ModelContextWindows
   visionRouter?: VisionRouter
+  fallbackProviderId?: string
   notes?: string
 }
 
@@ -68,6 +70,7 @@ export type UpdateProviderInput = {
   autoCompactWindow?: number | null
   modelContextWindows?: ModelContextWindows | null
   visionRouter?: VisionRouter | null
+  fallbackProviderId?: string | null
   notes?: string
 }
 

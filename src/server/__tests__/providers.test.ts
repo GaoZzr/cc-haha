@@ -166,6 +166,18 @@ describe('ProviderService', () => {
       expect(provider.models.main).toBe('model-main')
     })
 
+    test('should preserve an explicit fallback provider id', async () => {
+      const svc = new ProviderService()
+      const fallback = await svc.addProvider(sampleInput({ name: 'Fallback Provider' }))
+      const primary = await svc.addProvider(sampleInput({
+        name: 'Primary Provider',
+        fallbackProviderId: fallback.id,
+      }))
+
+      expect(primary.fallbackProviderId).toBe(fallback.id)
+      expect(await svc.getFallbackProviderId(primary.id)).toBe(fallback.id)
+    })
+
     test('should normalize empty model mappings to the main model when adding a provider', async () => {
       const svc = new ProviderService()
       const provider = await svc.addProvider(sampleInput({
@@ -485,6 +497,26 @@ describe('ProviderService', () => {
       expect(updated.baseUrl).toBe('https://new-api.example.com')
       // unchanged fields preserved
       expect(updated.apiKey).toBe('sk-test-key-123')
+    })
+
+    test('should update and clear fallback provider id', async () => {
+      const svc = new ProviderService()
+      const primary = await svc.addProvider(sampleInput({ name: 'Primary' }))
+      const fallback = await svc.addProvider(sampleInput({ name: 'Fallback' }))
+
+      let updated = await svc.updateProvider(primary.id, {
+        fallbackProviderId: fallback.id,
+      })
+
+      expect(updated.fallbackProviderId).toBe(fallback.id)
+      expect(await svc.getFallbackProviderId(primary.id)).toBe(fallback.id)
+
+      updated = await svc.updateProvider(primary.id, {
+        fallbackProviderId: null,
+      })
+
+      expect(updated.fallbackProviderId).toBeUndefined()
+      expect(await svc.getFallbackProviderId(primary.id)).toBeNull()
     })
 
     test('should throw 404 for non-existent provider', async () => {
@@ -1766,6 +1798,20 @@ describe('Providers API', () => {
   })
 
   // ─── POST /api/providers ─────────────────────────────────────────────────
+
+  test('GET /api/providers should include provider display order', async () => {
+    const svc = new ProviderService()
+    const a = await svc.addProvider(sampleInput({ name: 'A' }))
+    const b = await svc.addProvider(sampleInput({ name: 'B' }))
+    await svc.reorderProviders([b.id, a.id, 'claude-official', 'openai-official'])
+
+    const { req, url, segments } = makeRequest('GET', '/api/providers')
+    const res = await handleProvidersApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { providerOrder: string[] }
+    expect(body.providerOrder).toEqual([b.id, a.id, 'claude-official', 'openai-official'])
+  })
 
   test('POST /api/providers should create a provider', async () => {
     const { req, url, segments } = makeRequest('POST', '/api/providers', {

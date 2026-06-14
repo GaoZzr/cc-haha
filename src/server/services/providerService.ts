@@ -227,6 +227,7 @@ export class ProviderService {
       ...(input.autoCompactWindow !== undefined && { autoCompactWindow: input.autoCompactWindow }),
       ...(input.modelContextWindows !== undefined && { modelContextWindows: input.modelContextWindows }),
       ...(input.visionRouter !== undefined && { visionRouter: input.visionRouter }),
+      ...(input.fallbackProviderId !== undefined && { fallbackProviderId: input.fallbackProviderId }),
       ...(input.notes !== undefined && { notes: input.notes }),
     }
 
@@ -254,6 +255,7 @@ export class ProviderService {
       ...(typeof input.autoCompactWindow === 'number' && { autoCompactWindow: input.autoCompactWindow }),
       ...(input.modelContextWindows !== undefined && input.modelContextWindows !== null && { modelContextWindows: input.modelContextWindows }),
       ...(input.visionRouter !== undefined && input.visionRouter !== null && { visionRouter: input.visionRouter }),
+      ...(input.fallbackProviderId !== undefined && input.fallbackProviderId !== null && { fallbackProviderId: input.fallbackProviderId }),
       ...(input.notes !== undefined && { notes: input.notes }),
     }
     if (input.autoCompactWindow === null) {
@@ -264,6 +266,9 @@ export class ProviderService {
     }
     if (input.visionRouter === null) {
       delete updated.visionRouter
+    }
+    if (input.fallbackProviderId === null) {
+      delete updated.fallbackProviderId
     }
 
     index.providers[idx] = updated
@@ -366,6 +371,23 @@ export class ProviderService {
     return this.buildManagedEnv(provider, {
       proxyPath: `/proxy/providers/${provider.id}`,
     })
+  }
+
+  async getFallbackProviderId(id: string): Promise<string | null> {
+    if (isOpenAIOfficialProviderId(id)) return null
+
+    const index = await this.readIndex()
+    const provider = index.providers.find((p) => p.id === id)
+    const fallbackProviderId = provider?.fallbackProviderId?.trim()
+    if (!fallbackProviderId || fallbackProviderId === id) return null
+
+    if (isOpenAIOfficialProviderId(fallbackProviderId)) {
+      return fallbackProviderId
+    }
+
+    return index.providers.some((entry) => entry.id === fallbackProviderId)
+      ? fallbackProviderId
+      : null
   }
 
   private async syncToSettings(provider: SavedProvider): Promise<void> {

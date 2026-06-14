@@ -87,11 +87,21 @@ export function normalizeModelMapping(models: SavedProvider['models']): SavedPro
 }
 
 export function normalizeSavedProvider(provider: SavedProvider): SavedProvider {
+  const {
+    fallbackProviderId: rawFallbackProviderId,
+    ...rest
+  } = provider
+  const fallbackProviderId =
+    typeof rawFallbackProviderId === 'string' && rawFallbackProviderId.trim()
+      ? rawFallbackProviderId.trim()
+      : undefined
+
   return {
-    ...provider,
+    ...rest,
     apiFormat: provider.apiFormat ?? 'anthropic',
     runtimeKind: provider.runtimeKind ?? 'anthropic_compatible',
     models: normalizeModelMapping(provider.models),
+    ...(fallbackProviderId ? { fallbackProviderId } : {}),
   }
 }
 

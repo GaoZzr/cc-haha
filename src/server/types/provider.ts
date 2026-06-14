@@ -55,6 +55,8 @@ export const VisionRouterSchema = z.object({
   trigger: z.literal('image').optional(),
 })
 
+export const FallbackProviderIdSchema = z.string().min(1)
+
 export const SavedProviderSchema = z.object({
   id: z.string(),
   presetId: z.string(),
@@ -68,6 +70,7 @@ export const SavedProviderSchema = z.object({
   autoCompactWindow: AutoCompactWindowSchema.optional(),
   modelContextWindows: ModelContextWindowsSchema.optional(),
   visionRouter: VisionRouterSchema.optional(),
+  fallbackProviderId: FallbackProviderIdSchema.optional(),
   notes: z.string().optional(),
 })
 
@@ -90,6 +93,7 @@ export const CreateProviderSchema = z.object({
   autoCompactWindow: AutoCompactWindowSchema.optional(),
   modelContextWindows: ModelContextWindowsSchema.optional(),
   visionRouter: VisionRouterSchema.optional(),
+  fallbackProviderId: FallbackProviderIdSchema.optional(),
   notes: z.string().optional(),
 })
 
@@ -104,6 +108,7 @@ export const UpdateProviderSchema = z.object({
   autoCompactWindow: AutoCompactWindowSchema.nullable().optional(),
   modelContextWindows: ModelContextWindowsSchema.nullable().optional(),
   visionRouter: VisionRouterSchema.nullable().optional(),
+  fallbackProviderId: FallbackProviderIdSchema.nullable().optional(),
   notes: z.string().optional(),
 })
 

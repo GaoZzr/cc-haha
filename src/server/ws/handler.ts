@@ -89,6 +89,13 @@ type RuntimeOverride = {
   effort?: string
 }
 
+type ProviderFallbackPlan = {
+  primaryProviderId: string
+  fallbackProviderId: string
+  fallbackModelId: string
+  effort?: string
+}
+
 type ActiveUserTurnState = {
   messageSent: boolean
 }
@@ -108,6 +115,8 @@ const prewarmedSessions = new Set<string>()
 const prewarmIdleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const DEFAULT_PREWARM_IDLE_TIMEOUT_MS = 5 * 60_000
 const VALID_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'max'])
+const PROVIDER_FALLBACK_ERROR_PATTERN =
+  /\b(api|upstream|gateway|provider|network|timeout|timed out|rate limit|quota|overload|overloaded|usage policy|acceptable use|aup|policy|blocked|forbidden|unauthorized|auth|429|529|5\d\d|econnreset|econnrefused|socket|fetch)\b/i
 
 async function sendRepositoryStartupStatus(
   ws: ServerWebSocket<WebSocketData>,
@@ -393,10 +402,26 @@ async function handleUserMessage(
     return
   }
 
+  const providerFallbackPlan = await getProviderFallbackPlan(sessionId)
+
   // Register the callback before sending the turn so startup errors are not lost.
   // Keep output muted until the current user turn is enqueued to avoid forwarding
   // any pre-turn SDK chatter as fresh chat history.
   let userMessageSent = false
+  let suppressProviderFallbackError = false
+  let providerFallbackRetryStarted = false
+  let removeActiveTurnOutputCallback: (() => void) | null = null
+  const removeProviderFallbackOutputCallback = providerFallbackPlan
+    ? bindProviderFallbackRetry(ws, sessionId, message, providerFallbackPlan, {
+        markSuppress: () => {
+          suppressProviderFallbackError = true
+        },
+        markRetryStarted: () => {
+          providerFallbackRetryStarted = true
+          removeActiveTurnOutputCallback?.()
+        },
+      })
+    : null
   const shouldForwardCurrentTurnLocalCommand =
     createCurrentTurnLocalCommandForwarder(desktopSlashCommand)
   const removeTitleOutputCallback = titleTurnNumber === null
@@ -405,13 +430,19 @@ async function handleUserMessage(
 
   bindAllClientSessionOutputs(sessionId, {
     shouldForward: (cliMsg) => {
+      if (providerFallbackRetryStarted) {
+        return false
+      }
+      if (suppressProviderFallbackError && isProviderFallbackErrorMessage(cliMsg)) {
+        return false
+      }
       if (userMessageSent || (cliMsg.type === 'result' && cliMsg.is_error)) {
         return true
       }
       return shouldForwardCurrentTurnLocalCommand(cliMsg)
     },
   })
-  const removeActiveTurnOutputCallback = bindActiveUserTurnCompletion(ws, sessionId, activeTurn)
+  removeActiveTurnOutputCallback = bindActiveUserTurnCompletion(ws, sessionId, activeTurn)
 
   const sent = await conversationService.sendMessage(
     sessionId,
@@ -419,7 +450,8 @@ async function handleUserMessage(
     message.attachments
   )
   if (!sent) {
-    removeActiveTurnOutputCallback()
+    removeProviderFallbackOutputCallback?.()
+    removeActiveTurnOutputCallback?.()
     clearActiveUserTurn(sessionId, activeTurn)
     removeTitleOutputCallback?.()
     discardActiveTitleTurn(sessionId, titleTurnNumber)
@@ -440,6 +472,183 @@ function clearActiveUserTurn(sessionId: string, activeTurn: ActiveUserTurnState)
   if (activeUserTurns.get(sessionId) === activeTurn) {
     activeUserTurns.delete(sessionId)
   }
+}
+
+async function getProviderFallbackPlan(sessionId: string): Promise<ProviderFallbackPlan | null> {
+  const runtimeSettings = await getRuntimeSettings(sessionId)
+  if (typeof runtimeSettings.providerId !== 'string') return null
+
+  const fallbackProviderId = await providerService.getFallbackProviderId(runtimeSettings.providerId)
+  if (!fallbackProviderId) return null
+
+  const fallbackProvider = await providerService.getProvider(fallbackProviderId).catch(() => null)
+  const fallbackModelId = fallbackProvider?.models.main.trim()
+  if (!fallbackModelId) return null
+
+  return {
+    primaryProviderId: runtimeSettings.providerId,
+    fallbackProviderId,
+    fallbackModelId,
+    ...(runtimeSettings.effort ? { effort: runtimeSettings.effort } : {}),
+  }
+}
+
+function bindProviderFallbackRetry(
+  ws: ServerWebSocket<WebSocketData>,
+  sessionId: string,
+  message: Extract<ClientMessage, { type: 'user_message' }>,
+  plan: ProviderFallbackPlan,
+  callbacks: {
+    markSuppress: () => void
+    markRetryStarted: () => void
+  },
+): () => void {
+  let sawProviderApiError = false
+  let retryStarted = false
+
+  const callback = (cliMsg: any) => {
+    if (retryStarted) return
+
+    if (isAssistantProviderApiError(cliMsg)) {
+      sawProviderApiError = true
+      callbacks.markSuppress()
+      return
+    }
+
+    if (cliMsg?.type !== 'result') return
+
+    conversationService.removeOutputCallback(sessionId, callback)
+    const shouldFallback =
+      cliMsg.is_error === true &&
+      (sawProviderApiError || isProviderFallbackableResult(cliMsg))
+    if (!shouldFallback) return
+
+    retryStarted = true
+    callbacks.markSuppress()
+    callbacks.markRetryStarted()
+
+    void enqueueRuntimeTransition(sessionId, async () => {
+      await retryUserTurnWithFallbackProvider(ws, sessionId, message, plan, cliMsg)
+    }).catch((err) => {
+      const errMsg = err instanceof Error ? err.message : String(err)
+      void diagnosticsService.recordEvent({
+        type: 'provider_fallback_failed',
+        severity: 'error',
+        sessionId,
+        summary: errMsg,
+        details: {
+          primaryProviderId: plan.primaryProviderId,
+          fallbackProviderId: plan.fallbackProviderId,
+          fallbackModelId: plan.fallbackModelId,
+          error: err,
+        },
+      })
+      sendMessage(ws, {
+        type: 'error',
+        message: `Provider fallback failed: ${errMsg}`,
+        code: 'PROVIDER_FALLBACK_FAILED',
+      })
+      sendMessage(ws, { type: 'status', state: 'idle' })
+    })
+  }
+
+  conversationService.onOutput(sessionId, callback)
+  return () => conversationService.removeOutputCallback(sessionId, callback)
+}
+
+async function retryUserTurnWithFallbackProvider(
+  ws: ServerWebSocket<WebSocketData>,
+  sessionId: string,
+  message: Extract<ClientMessage, { type: 'user_message' }>,
+  plan: ProviderFallbackPlan,
+  failedMessage: any,
+): Promise<void> {
+  const workDir =
+    conversationService.getSessionWorkDir(sessionId) ||
+    await sessionService.getSessionWorkDir(sessionId)
+  if (!workDir) {
+    throw new Error('Cannot resolve session workDir for provider fallback')
+  }
+
+  const nextOverride: RuntimeOverride = {
+    providerId: plan.fallbackProviderId,
+    modelId: plan.fallbackModelId,
+    ...(plan.effort ? { effort: plan.effort } : {}),
+  }
+
+  sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Switching provider' })
+  runtimeOverrides.set(sessionId, nextOverride)
+  runtimeOverrideVersions.set(
+    sessionId,
+    (runtimeOverrideVersions.get(sessionId) ?? 0) + 1,
+  )
+  await persistSessionRuntimeConfig(sessionId, nextOverride)
+
+  void diagnosticsService.recordEvent({
+    type: 'provider_fallback_triggered',
+    severity: 'warn',
+    sessionId,
+    summary: `Provider fallback ${plan.primaryProviderId} -> ${plan.fallbackProviderId}`,
+    details: {
+      primaryProviderId: plan.primaryProviderId,
+      fallbackProviderId: plan.fallbackProviderId,
+      fallbackModelId: plan.fallbackModelId,
+      originalError: summarizeProviderFallbackError(failedMessage),
+    },
+  })
+
+  conversationService.stopSession(sessionId)
+
+  const sdkUrl =
+    `ws://${ws.data.serverHost}:${ws.data.serverPort}/sdk/${sessionId}` +
+    `?token=${encodeURIComponent(crypto.randomUUID())}`
+  const runtimeSettings = await getRuntimeSettings(sessionId)
+  await conversationService.startSession(sessionId, workDir, sdkUrl, runtimeSettings)
+
+  bindAllClientSessionOutputs(sessionId)
+  const fallbackTurn: ActiveUserTurnState = { messageSent: false }
+  activeUserTurns.set(sessionId, fallbackTurn)
+  const removeFallbackTurnOutputCallback = bindActiveUserTurnCompletion(ws, sessionId, fallbackTurn)
+
+  sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Thinking' })
+  const sent = await conversationService.sendMessage(
+    sessionId,
+    message.content,
+    message.attachments,
+  )
+  if (!sent) {
+    removeFallbackTurnOutputCallback()
+    clearActiveUserTurn(sessionId, fallbackTurn)
+    throw new Error('CLI process is not running after provider fallback restart')
+  }
+  fallbackTurn.messageSent = true
+}
+
+function isAssistantProviderApiError(cliMsg: any): boolean {
+  return (
+    cliMsg?.type === 'assistant' &&
+    (cliMsg.isApiErrorMessage === true || typeof cliMsg.error === 'string')
+  )
+}
+
+function isProviderFallbackErrorMessage(cliMsg: any): boolean {
+  return isAssistantProviderApiError(cliMsg) || isProviderFallbackableResult(cliMsg)
+}
+
+function isProviderFallbackableResult(cliMsg: any): boolean {
+  if (cliMsg?.type !== 'result' || cliMsg.is_error !== true) return false
+  return PROVIDER_FALLBACK_ERROR_PATTERN.test(summarizeProviderFallbackError(cliMsg))
+}
+
+function summarizeProviderFallbackError(cliMsg: any): string {
+  if (!cliMsg || typeof cliMsg !== 'object') return ''
+  const fragments = [
+    typeof cliMsg.error === 'string' ? cliMsg.error : '',
+    typeof cliMsg.result === 'string' ? cliMsg.result : '',
+    Array.isArray(cliMsg.errors) ? cliMsg.errors.join('\n') : '',
+    typeof cliMsg.status === 'string' ? cliMsg.status : '',
+  ]
+  return fragments.filter(Boolean).join('\n').slice(0, 2000)
 }
 
 function bindActiveUserTurnCompletion(
