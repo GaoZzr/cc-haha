@@ -63,6 +63,11 @@ export type RedteamValidationResult = {
 const REDTEAM_CONTRACT_MARKER = 'CC_HAHA_REDTEAM_WORKFLOW_CONTRACT'
 const activeRuns = new Map<string, RedteamWorkflowRun>()
 
+function requiresManualConfirmationGate(): boolean {
+  const raw = process.env.CC_HAHA_REDTEAM_REQUIRE_CONFIRMATION_GATE?.trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
+}
+
 export function prepareRedteamWorkflowPrompt(
   sessionId: string,
   content: string,
@@ -93,8 +98,10 @@ export function prepareRedteamWorkflowPrompt(
   const coverageProfile = inferCoverageProfile(content, target, existingRun?.coverageProfile)
   const coverageOraclePath = getCoverageOraclePath()
   const coverageOracleAvailable = fs.existsSync(coverageOraclePath)
+  const autoConfirmGate = !requiresManualConfirmationGate()
   const gateComplete =
     isRepairFollowup ||
+    (autoConfirmGate && (isRedteamRequest || isPendingGateReply)) ||
     (isPendingGateReply
       ? isGateFollowup
       : hasRequiredGateFields(content))

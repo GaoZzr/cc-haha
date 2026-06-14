@@ -1048,11 +1048,13 @@ describe('ProviderService', () => {
   })
 
   describe('handleProxyRequest', () => {
-    test('returns a redteam confirmation gate without calling upstream while pending', async () => {
+    test('returns a redteam confirmation gate without calling upstream when manual gate mode is enabled', async () => {
       const originalFetch = globalThis.fetch
+      const originalGate = process.env.CC_HAHA_REDTEAM_REQUIRE_CONFIRMATION_GATE
       const sessionHeader = 'redteam-handler-pending'
       const sessionId = `proxy:${sessionHeader}`
       let fetchCalls = 0
+      process.env.CC_HAHA_REDTEAM_REQUIRE_CONFIRMATION_GATE = '1'
       globalThis.fetch = mock(async () => {
         fetchCalls += 1
         return new Response('{}', { status: 500 })
@@ -1085,12 +1087,17 @@ describe('ProviderService', () => {
         expect(data.content[0].text).toContain('请确认执行选项')
         expect(data.content[0].text).toContain('https://example.com/')
       } finally {
+        if (originalGate === undefined) {
+          delete process.env.CC_HAHA_REDTEAM_REQUIRE_CONFIRMATION_GATE
+        } else {
+          process.env.CC_HAHA_REDTEAM_REQUIRE_CONFIRMATION_GATE = originalGate
+        }
         clearRedteamWorkflowSession(sessionId)
         globalThis.fetch = originalFetch
       }
     })
 
-    test('injects the redteam workflow contract after explicit gate confirmation', async () => {
+    test('injects the redteam workflow contract immediately by default', async () => {
       const originalFetch = globalThis.fetch
       const sessionHeader = 'redteam-handler-confirmed'
       const sessionId = `proxy:${sessionHeader}`
@@ -1129,24 +1136,7 @@ describe('ProviderService', () => {
             messages: [{ role: 'user', content: 'red team test https://example.com/' }],
           }),
         })
-        const gate = await handleProxyRequest(startReq, new URL(startReq.url))
-        expect(gate.status).toBe(200)
-        expect(calls).toHaveLength(0)
-
-        const confirmReq = new Request('http://localhost:3456/proxy/v1/messages', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-cc-haha-session-id': sessionHeader,
-            'x-cc-haha-work-dir': tmpDir,
-          },
-          body: JSON.stringify({
-            model: 'gpt-4',
-            max_tokens: 64,
-            messages: [{ role: 'user', content: 'OK' }],
-          }),
-        })
-        const res = await handleProxyRequest(confirmReq, new URL(confirmReq.url))
+        const res = await handleProxyRequest(startReq, new URL(startReq.url))
         expect(res.status).toBe(200)
         expect(calls).toHaveLength(1)
 

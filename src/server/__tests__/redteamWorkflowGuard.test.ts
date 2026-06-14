@@ -177,7 +177,7 @@ describe('redteam workflow guard', () => {
     }
   })
 
-  it('arms a pending gate only when redteam intent and target are both present', async () => {
+  it('auto-confirms redteam requests with default execution options', async () => {
     const workDir = await tempWorkDir()
     const result = prepareRedteamWorkflowPrompt(
       'gate-session',
@@ -187,13 +187,10 @@ describe('redteam workflow guard', () => {
 
     expect(result.injected).toBe(true)
     expect(result.run?.target).toBe('https://43.143.205.232/')
-    expect(result.run?.awaitingGate).toBe(true)
-    expect(result.run?.validationRequired).toBe(false)
+    expect(result.run?.awaitingGate).toBe(false)
+    expect(result.run?.validationRequired).toBe(true)
     expect(result.content).toContain('CC_HAHA_REDTEAM_WORKFLOW_CONTRACT')
-    expect(result.content).toContain('Gate state: pending confirmation')
-    const gate = formatRedteamConfirmationGate(result.run!)
-    expect(gate).toContain('报告模板：')
-    expect(gate).toContain('截图留证：')
+    expect(result.content).toContain('Gate state: confirmed')
     expect(result.run?.reportTemplate).toBe('default')
     expect(result.run?.screenshotProfile).toBe('packet-only')
 
@@ -205,11 +202,14 @@ describe('redteam workflow guard', () => {
       workDir,
     )
     expect(noSpaceResult.run?.target).toBe('https://demo.owasp-juice.shop/')
+    expect(noSpaceResult.run?.awaitingGate).toBe(false)
     clearRedteamWorkflowSession('gate-nospace-session')
   })
 
-  it('does not treat ambiguous partial gate replies as confirmed', async () => {
+  it('keeps ambiguous partial gate replies pending when manual gate mode is enabled', async () => {
     const workDir = await tempWorkDir()
+    const original = process.env.CC_HAHA_REDTEAM_REQUIRE_CONFIRMATION_GATE
+    process.env.CC_HAHA_REDTEAM_REQUIRE_CONFIRMATION_GATE = '1'
     prepareRedteamWorkflowPrompt(
       'partial-gate-session',
       '对 https://43.143.205.232/ 进行红队测试',
@@ -224,22 +224,28 @@ describe('redteam workflow guard', () => {
       expect(result.content).toContain('Gate state: pending confirmation')
     }
 
+    if (original === undefined) {
+      delete process.env.CC_HAHA_REDTEAM_REQUIRE_CONFIRMATION_GATE
+    } else {
+      process.env.CC_HAHA_REDTEAM_REQUIRE_CONFIRMATION_GATE = original
+    }
     clearRedteamWorkflowSession('partial-gate-session')
   })
 
-  it('turns an explicit short gate confirmation into a source-level validation requirement', async () => {
+  it('turns an initial redteam request into a source-level validation requirement', async () => {
     const workDir = await tempWorkDir()
-    prepareRedteamWorkflowPrompt(
+    const confirmed = prepareRedteamWorkflowPrompt(
       'confirmed-session',
       '对 https://43.143.205.232/ 进行红队测试',
       workDir,
     )
 
-    const confirmed = prepareRedteamWorkflowPrompt(
+    const followup = prepareRedteamWorkflowPrompt(
       'confirmed-session',
       '确认',
       workDir,
     )
+    expect(followup.injected).toBe(false)
     const validation = await validateRedteamWorkflowForSession('confirmed-session')
 
     expect(confirmed.run?.awaitingGate).toBe(false)
@@ -278,17 +284,18 @@ describe('redteam workflow guard', () => {
 
   it('injects command-safety guidance for cc-haha WSL redteam runs', async () => {
     const workDir = await tempWorkDir()
-    prepareRedteamWorkflowPrompt(
+    const confirmed = prepareRedteamWorkflowPrompt(
       'contract-session',
       'red team test https://43.143.205.232/',
       workDir,
     )
 
-    const confirmed = prepareRedteamWorkflowPrompt(
+    const followup = prepareRedteamWorkflowPrompt(
       'contract-session',
       'OK',
       workDir,
     )
+    expect(followup.injected).toBe(false)
     expect(confirmed.content).toContain('quick port-state scan first')
     expect(confirmed.content).toContain('Do not rely on transient shell variables')
     expect(confirmed.content).toContain('Do not continue by manually composing a substitute workflow')
@@ -301,17 +308,18 @@ describe('redteam workflow guard', () => {
 
   it('injects coverage oracle bridge guidance for routed redteam runs', async () => {
     const workDir = await tempWorkDir()
-    prepareRedteamWorkflowPrompt(
+    const confirmed = prepareRedteamWorkflowPrompt(
       'coverage-bridge-session',
       'red team test https://example.com/',
       workDir,
     )
 
-    const confirmed = prepareRedteamWorkflowPrompt(
+    const followup = prepareRedteamWorkflowPrompt(
       'coverage-bridge-session',
       'OK',
       workDir,
     )
+    expect(followup.injected).toBe(false)
     expect(confirmed.run?.coverageProfile).toBe('web_app')
     expect(confirmed.content).toContain('Coverage oracle bridge')
     expect(confirmed.content).toContain('coverage_oracle.py')
@@ -337,17 +345,18 @@ describe('redteam workflow guard', () => {
 
   it('accepts a complete ledger and report as a valid source-level workflow', async () => {
     const workDir = await tempWorkDir()
-    prepareRedteamWorkflowPrompt(
+    const confirmed = prepareRedteamWorkflowPrompt(
       'valid-session',
       '对 https://43.143.205.232/ 进行红队测试',
       workDir,
     )
 
-    const confirmed = prepareRedteamWorkflowPrompt(
+    const followup = prepareRedteamWorkflowPrompt(
       'valid-session',
       '确认',
       workDir,
     )
+    expect(followup.injected).toBe(false)
     recordRedteamWorkflowCliMessage('valid-session', {
       message: {
         content: [
