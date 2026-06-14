@@ -78,24 +78,25 @@ export function prepareRedteamWorkflowPrompt(
   }
 
   const existingRun = activeRuns.get(sessionId)
-  const detectedTarget = extractRedteamTarget(content)
-  const hasRedteamIntent = looksLikeRedteamRequest(content)
+  const intentContent = extractUserIntentContent(content)
+  const detectedTarget = extractRedteamTarget(intentContent)
+  const hasRedteamIntent = looksLikeRedteamRequest(intentContent)
   const isRedteamRequest = detectedTarget !== null && hasRedteamIntent
   const isPendingGateReply = existingRun?.awaitingGate === true
   const isGateFollowup =
-    isPendingGateReply && isCompleteGateConfirmation(content)
+    isPendingGateReply && isCompleteGateConfirmation(intentContent)
   const isRepairFollowup =
-    existingRun?.needsRepair === true && looksLikeWorkflowRepair(content)
+    existingRun?.needsRepair === true && looksLikeWorkflowRepair(intentContent)
 
   if (!isRedteamRequest && !isPendingGateReply && !isRepairFollowup) {
     return { content, run: existingRun ?? null, injected: false }
   }
 
   const target = detectedTarget ?? existingRun?.target ?? 'unknown-target'
-  const reportFormat = inferReportFormat(content, existingRun?.reportFormat)
-  const reportTemplate = inferReportTemplate(content, existingRun?.reportTemplate)
-  const screenshotProfile = inferScreenshotProfile(content, existingRun?.screenshotProfile)
-  const coverageProfile = inferCoverageProfile(content, target, existingRun?.coverageProfile)
+  const reportFormat = inferReportFormat(intentContent, existingRun?.reportFormat)
+  const reportTemplate = inferReportTemplate(intentContent, existingRun?.reportTemplate)
+  const screenshotProfile = inferScreenshotProfile(intentContent, existingRun?.screenshotProfile)
+  const coverageProfile = inferCoverageProfile(intentContent, target, existingRun?.coverageProfile)
   const coverageOraclePath = getCoverageOraclePath()
   const coverageOracleAvailable = fs.existsSync(coverageOraclePath)
   const autoConfirmGate = !requiresManualConfirmationGate()
@@ -104,7 +105,7 @@ export function prepareRedteamWorkflowPrompt(
     (autoConfirmGate && (isRedteamRequest || isPendingGateReply)) ||
     (isPendingGateReply
       ? isGateFollowup
-      : hasRequiredGateFields(content))
+      : hasRequiredGateFields(intentContent))
   const run =
     existingRun && existingRun.target === target
       ? {
@@ -398,6 +399,14 @@ function stringifyForFailureScan(value: unknown): string {
 
 function compactFailureReason(value: string): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, 240)
+}
+
+function extractUserIntentContent(content: string): string {
+  return content
+    .replace(/<available-deferred-tools>[\s\S]*?<\/available-deferred-tools>/gi, '\n')
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '\n')
+    .replace(/<user-prompt-submit-hook>[\s\S]*?<\/user-prompt-submit-hook>/gi, '\n')
+    .trim()
 }
 
 function buildContract(run: RedteamWorkflowRun): string {

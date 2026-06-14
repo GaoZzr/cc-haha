@@ -177,6 +177,28 @@ describe('redteam workflow guard', () => {
     }
   })
 
+  it('ignores SDK context blocks when detecting redteam intent', async () => {
+    const workDir = await tempWorkDir()
+    const prompt = [
+      '<available-deferred-tools>',
+      'WebFetch',
+      'WebSearch',
+      '</available-deferred-tools>',
+      '<system-reminder>',
+      'Use redteam-commander for authorized red-team work.',
+      'WSL outbound HTTPS works; curl -I https://github.com returned HTTP 200.',
+      '</system-reminder>',
+      '',
+      'Return exactly OK.',
+    ].join('\n')
+
+    const result = prepareRedteamWorkflowPrompt('sdk-context-ok-session', prompt, workDir)
+
+    expect(result.injected).toBe(false)
+    expect(result.content).toBe(prompt)
+    expect(result.run).toBeNull()
+  })
+
   it('auto-confirms redteam requests with default execution options', async () => {
     const workDir = await tempWorkDir()
     const result = prepareRedteamWorkflowPrompt(
